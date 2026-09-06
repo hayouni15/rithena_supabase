@@ -1,4 +1,6 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { creativeBriefPrompt, parseCreativeBrief, type CreativeBrief } from "./creative.ts";
+import { selectMusic } from "./music.ts";
 
 type Job = {
   id: string; organization_id: string; brand_id: string; content_item_id: string;
@@ -44,9 +46,42 @@ function strategy(job: Job) {
   return { pipeline: String(input.pipeline || (job.type === "video" ? "veo_text_to_video" : "gemini_image")), title: String(value.title || ""), hook: String(value.hook || ""), concept: String(value.concept || ""), direction: String(value.creativeDirection || ""), cta: String(value.callToAction || "") };
 }
 
-function prompt(job: Job) {
-  const item = strategy(job);
-  return `Create premium, distinctive social creative for a real brand. Concept: ${item.concept}. Working title: ${item.title}. Hook: ${item.hook}. Art direction: ${item.direction}. CTA intent: ${item.cta}. Make one coherent scene with deliberate composition, realistic lighting, specific materials, and generous mobile safe zones. Do not render text, logos, watermarks, UI, buttons, or invented product claims.`;
+function savedBrief(job: Job) {
+  const value = job.output?.creativeBrief;
+  return value && typeof value === "object" ? value as CreativeBrief : null;
+}
+
+async function generateCreativeBrief(job: Job, token: string) {
+  const project = env("GOOGLE_CLOUD_PROJECT");
+  const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
+  const model = Deno.env.get("CREATIVE_GEMINI_MODEL") || Deno.env.get("STRATEGY_GEMINI_MODEL") || "gemini-2.5-flash";
+  const result = await vertex(`projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`, token, {
+    contents: [{ role: "user", parts: [{ text: creativeBriefPrompt(job) }] }],
+    generationConfig: { responseMimeType: "application/json", temperature: 0.85, maxOutputTokens: 8192 },
+  });
+  const text = (result.candidates?.[0]?.content?.parts || []).map((part: { text?: string }) => part.text || "").join("");
+  return parseCreativeBrief(text);
+}
+
+async function savePlatformCopy(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief) {
+  const platforms = ((job.input?.strategy as Record<string, unknown> | undefined)?.platforms || []) as string[];
+  const format = job.type === "video" ? "short_video" : "image";
+  for (const platform of platforms) {
+    const variant = await db.from("platform_variants").upsert({
+      organization_id: job.organization_id, content_item_id: job.content_item_id, platform, format,
+      status: "ready", aspect_ratio: job.type === "video" ? "9:16" : "4:5", duration_seconds: job.type === "video" ? 8 : null,
+      selected_media_asset_id: assetId, platform_config: { generatedBy: "n8n-parity-v1" },
+    }, { onConflict: "content_item_id,platform" }).select("id").single();
+    if (variant.error) throw new Error(`Platform variant failed: ${variant.error.message}`);
+    const hashtags = brief.social_post.hashtags?.[platform] || [];
+    const copy = await db.from("post_copies").upsert({
+      organization_id: job.organization_id, platform_variant_id: variant.data.id, locale: "en", version: 1, is_selected: true,
+      headline: brief.text_overlay.headline.text, subhead: brief.text_overlay.subhead.text,
+      caption: brief.social_post.caption, hashtags, call_to_action: brief.text_overlay.cta.text,
+      title: platform === "youtube" ? brief.social_post.titles?.youtube : platform === "tiktok" ? brief.social_post.titles?.tiktok : null,
+    }, { onConflict: "platform_variant_id,locale,version" });
+    if (copy.error) throw new Error(`Platform copy failed: ${copy.error.message}`);
+  }
 }
 
 async function checkpoint(db: DatabaseClient, job: Job, worker: string, stage: string, progress: number, state: string, output: Record<string, unknown> = {}, externalId?: string, retryAfter?: number, errorCode?: string, errorMessage?: string) {
@@ -71,11 +106,15 @@ async function storeAsset(db: DatabaseClient, job: Job, bytes: Uint8Array, mimeT
 async function generateImage(db: DatabaseClient, job: Job, worker: string, token: string) {
   const project = env("GOOGLE_CLOUD_PROJECT"); const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
   const model = job.model || Deno.env.get("IMAGE_GEMINI_MODEL") || "gemini-3.1-flash-image";
-  const result = await vertex(`projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`, token, { contents: [{ role: "user", parts: [{ text: prompt(job) }] }], generationConfig: { responseModalities: ["TEXT", "IMAGE"], imageConfig: { aspectRatio: "4:5" } } });
+  const brief = savedBrief(job) || await generateCreativeBrief(job, token);
+  const typography = brief.text_overlay;
+  const imagePrompt = `${brief.media_prompt}\n\nRender only this exact copy with correct spelling: headline “${typography.headline.text}”; supporting line “${typography.subhead.text}”; CTA “${typography.cta.text}”. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
+  const result = await vertex(`projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`, token, { contents: [{ role: "user", parts: [{ text: imagePrompt }] }], generationConfig: { responseModalities: ["TEXT", "IMAGE"], imageConfig: { aspectRatio: "4:5" } } });
   const part = result.candidates?.[0]?.content?.parts?.find((candidate: Record<string, unknown>) => (candidate.inlineData as { mimeType?: string } | undefined)?.mimeType?.startsWith("image/"));
   if (!part?.inlineData?.data) throw new Error("Gemini returned no image data");
   const bytes = decodeBase64(part.inlineData.data); const assetId = await storeAsset(db, job, bytes, part.inlineData.mimeType || "image/png", result.responseId);
-  await checkpoint(db, job, worker, "media_ready", 100, "succeeded", { mediaAssetId: assetId });
+  await savePlatformCopy(db, job, assetId, brief);
+  await checkpoint(db, job, worker, "media_ready", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief });
 }
 
 async function downloadGcs(uri: string, token: string) {
@@ -85,14 +124,42 @@ async function downloadGcs(uri: string, token: string) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
+async function composeVideo(db: DatabaseClient, job: Job, bytes: Uint8Array, brief: CreativeBrief) {
+  const composerUrl = env("MEDIA_COMPOSER_URL").replace(/\/$/, "");
+  const composerSecret = env("MEDIA_COMPOSER_SECRET");
+  const rawPath = `${job.organization_id}/${job.content_item_id}/${job.id}.raw.mp4`;
+  const upload = await db.storage.from("creative-media").upload(rawPath, bytes, { contentType: "video/mp4", upsert: true });
+  if (upload.error) throw new Error(`Raw video upload failed: ${upload.error.message}`);
+  try {
+    const signed = await db.storage.from("creative-media").createSignedUrl(rawPath, 900);
+    if (signed.error || !signed.data?.signedUrl) throw new Error(`Raw video signing failed: ${signed.error?.message || "unknown"}`);
+    const brand = (job.input?.brandBrain || {}) as Record<string, unknown>;
+    const response = await fetch(`${composerUrl}/compose`, {
+      method: "POST", signal: AbortSignal.timeout(140_000),
+      headers: { authorization: `Bearer ${composerSecret}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        sourceUrl: signed.data.signedUrl, musicUrl: selectMusic(brief, job.id), durationSeconds: 8,
+        brandName: String(brand.name || ""), logoUrl: String((brand.visual as Record<string, unknown> | undefined)?.logoUrl || ""),
+        layout: brief.text_overlay.layout, overlays: [brief.text_overlay.headline, brief.text_overlay.subhead, brief.text_overlay.cta],
+      }),
+    });
+    if (!response.ok) throw new Error(`Media composer failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
+    return new Uint8Array(await response.arrayBuffer());
+  } finally {
+    const removed = await db.storage.from("creative-media").remove([rawPath]);
+    if (removed.error) console.warn("raw_video_cleanup_failed", { jobId: job.id, message: removed.error.message });
+  }
+}
+
 async function handleVideo(db: DatabaseClient, job: Job, worker: string, token: string) {
   const project = env("GOOGLE_CLOUD_PROJECT"); const location = Deno.env.get("VEO_LOCATION") || "us-central1";
   const model = job.model || Deno.env.get("VEO_MODEL") || "veo-3.1-generate-001";
   const modelPath = `projects/${project}/locations/${location}/publishers/google/models/${model}`;
   if (!job.external_job_id) {
-    const result = await vertex(`${modelPath}:predictLongRunning`, token, { instances: [{ prompt: `${prompt(job)} Generate a cinematic vertical mobile video. Generate in vertical 9:16 portrait orientation for mobile. 8 seconds duration.` }], parameters: { aspectRatio: "9:16", durationSeconds: 8, sampleCount: 1 } });
+    const brief = savedBrief(job) || await generateCreativeBrief(job, token);
+    const result = await vertex(`${modelPath}:predictLongRunning`, token, { instances: [{ prompt: brief.media_prompt }], parameters: { aspectRatio: "9:16", durationSeconds: 8, sampleCount: 1, resolution: "1080p", generateAudio: false, negativePrompt: brief.negative_prompt } });
     if (!result.name) throw new Error("Veo returned no operation name");
-    await checkpoint(db, job, worker, "provider_processing", 35, "waiting_external", { submittedAt: new Date().toISOString() }, result.name, 30);
+    await checkpoint(db, job, worker, "provider_processing", 35, "waiting_external", { submittedAt: new Date().toISOString(), creativeBrief: brief }, result.name, 30);
     return;
   }
   const result = await vertex(`${modelPath}:fetchPredictOperation`, token, { operationName: job.external_job_id });
@@ -100,9 +167,12 @@ async function handleVideo(db: DatabaseClient, job: Job, worker: string, token: 
   if (result.error) throw new Error(`Veo generation failed: ${result.error.message || result.error.code}`);
   const videos = result.response?.videos || result.response?.predictions || [];
   if (!videos.length) throw new Error("Veo returned no video");
-  const bytes = videos[0].bytesBase64Encoded ? decodeBase64(videos[0].bytesBase64Encoded) : await downloadGcs(videos[0].gcsUri, token);
+  const rawBytes = videos[0].bytesBase64Encoded ? decodeBase64(videos[0].bytesBase64Encoded) : await downloadGcs(videos[0].gcsUri, token);
+  const brief = savedBrief(job); if (!brief) throw new Error("The saved creative brief is missing");
+  const bytes = await composeVideo(db, job, rawBytes, brief);
   const assetId = await storeAsset(db, job, bytes, "video/mp4", job.external_job_id);
-  await checkpoint(db, job, worker, "media_ready", 100, "succeeded", { mediaAssetId: assetId });
+  await savePlatformCopy(db, job, assetId, brief);
+  await checkpoint(db, job, worker, "media_ready", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief, musicUrl: selectMusic(brief, job.id) });
 }
 
 async function normalizeQueuedModel(db: DatabaseClient, job: Job) {
@@ -125,7 +195,7 @@ Deno.serve(async (request) => {
   if (!expected || request.headers.get("authorization") !== `Bearer ${expected}`) return json({ error: "Unauthorized" }, 401);
   const worker = `edge:${crypto.randomUUID()}`;
   const db = createClient(env("SUPABASE_URL"), env("SUPABASE_SERVICE_ROLE_KEY"), { auth: { persistSession: false } });
-  const claimed = await db.rpc("claim_next_generation_job", { p_worker_id: worker, p_lease_seconds: 120 });
+  const claimed = await db.rpc("claim_next_generation_job", { p_worker_id: worker, p_lease_seconds: 300 });
   if (claimed.error) { console.error("claim_failed", { message: claimed.error.message }); return json({ error: "Job claim failed" }, 500); }
   const job = claimed.data as Job | null;
   // A PostgreSQL function returning a composite type serializes SQL NULL as an
