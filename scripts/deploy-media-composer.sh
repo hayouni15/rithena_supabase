@@ -14,6 +14,11 @@ gcloud run deploy rithena-media-composer \
   --region "$region" \
   --source ../rithena/services/media-composer \
   --allow-unauthenticated \
+  --memory 1Gi \
+  --cpu 1 \
+  --concurrency 1 \
+  --timeout 180 \
+  --max-instances 3 \
   --set-env-vars "MEDIA_COMPOSER_SECRET=$composer_secret" \
   --quiet
 
@@ -26,5 +31,7 @@ SUPABASE_ACCESS_TOKEN="$PROD_ACCESS_TOKEN" npx supabase secrets set \
   "MEDIA_COMPOSER_SECRET=$composer_secret" \
   "MUSIC_LIBRARY_BASE_URL=${MUSIC_LIBRARY_BASE_URL:-https://objectstorage.ca-montreal-1.oraclecloud.com/n/axr2mzsugevy/b/rithena/o/music/}"
 
+node scripts/update-local-env.mjs .env MEDIA_COMPOSER_URL "$composer_url"
+
 echo "Media composer deployed at $composer_url"
-echo "Set MEDIA_COMPOSER_URL=$composer_url in rithena_supabase/.env before deploying generation-worker."
+echo "MEDIA_COMPOSER_URL was saved to rithena_supabase/.env."
