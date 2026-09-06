@@ -1,0 +1,26 @@
+{
+  "name": "rithena_supabase",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "migration:new": "npx supabase migration new",
+
+    "db:dry:staging": "npx dotenv -e .env -- sh -c 'SUPABASE_ACCESS_TOKEN=$STAGING_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$STAGING_DB_PASSWORD npx supabase link --project-ref $STAGING_PROJECT_REF && SUPABASE_ACCESS_TOKEN=$STAGING_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$STAGING_DB_PASSWORD npx supabase db push --dry-run'",
+
+    "db:push:staging": "npx dotenv -e .env -- sh -c 'SUPABASE_ACCESS_TOKEN=$STAGING_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$STAGING_DB_PASSWORD npx supabase link --project-ref $STAGING_PROJECT_REF && SUPABASE_ACCESS_TOKEN=$STAGING_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$STAGING_DB_PASSWORD npx supabase db push'",
+
+    "db:dry:prod": "npx dotenv -e .env -- sh -c 'SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$PROD_DB_PASSWORD npx supabase link --project-ref $PROD_PROJECT_REF && SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$PROD_DB_PASSWORD npx supabase db push --dry-run'",
+
+    "db:push:prod": "npx dotenv -e .env -- sh -c 'SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$PROD_DB_PASSWORD npx supabase link --project-ref $PROD_PROJECT_REF && SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$PROD_DB_PASSWORD npx supabase db push'",
+    "generation:deploy:prod": "npx dotenv -e .env -- sh -c 'SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN npx supabase secrets set --project-ref $PROD_PROJECT_REF CRON_SECRET=$CRON_SECRET GOOGLE_CLOUD_PROJECT=$GOOGLE_CLOUD_PROJECT GOOGLE_VERTEX_CREDENTIALS_B64=$GOOGLE_VERTEX_CREDENTIALS_B64 IMAGE_GEMINI_MODEL=$IMAGE_GEMINI_MODEL VEO_MODEL=$VEO_MODEL VEO_LOCATION=$VEO_LOCATION && SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN npx supabase functions deploy generation-worker --project-ref $PROD_PROJECT_REF --no-verify-jwt && SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN SUPABASE_PROJECT_REF=$PROD_PROJECT_REF node scripts/configure-generation-cron.mjs'"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "dotenv-cli": "^11.0.0",
+    "supabase": "^2.116.0"
+  }
+}
