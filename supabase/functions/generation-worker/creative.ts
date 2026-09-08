@@ -21,6 +21,7 @@ export function creativeBriefPrompt(job: BriefJob) {
   const input = job.input || {};
   const strategy = input.strategy || {};
   const brandBrain = input.brandBrain || {};
+  const regenerationDirection = typeof input.regenerationDirection === "string" ? input.regenerationDirection.trim() : "";
   const medium = job.type === "video" ? "one continuous 8-second vertical 9:16 video" : "one 1080x1350 4:5 portrait image";
   return `You are a senior commercial producer, art director, and social copywriter. Create a production-ready brief for ${medium}.
 
@@ -29,6 +30,11 @@ ${JSON.stringify(brandBrain, null, 2)}
 
 PLANNED CONTENT:
 ${JSON.stringify(strategy, null, 2)}
+
+${regenerationDirection ? `REGENERATION DIRECTION
+This is a fresh rendition of the same planned idea. Follow this human direction while preserving verified brand facts, the planned CTA, and platform constraints:
+${regenerationDirection}
+` : ""}
 
 GROUNDING RULES
 - Work for the supplied brand in any industry. Never import another company, product, audience, feature, location, URL, or visual identity.

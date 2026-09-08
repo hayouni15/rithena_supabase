@@ -1,10 +1,11 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { creativeBriefPrompt, parseCreativeBrief, type CreativeBrief } from "./creative.ts";
 import { selectMusic } from "./music.ts";
+import { runQualityChecks } from "./quality.ts";
 
 type Job = {
   id: string; organization_id: string; brand_id: string; content_item_id: string;
-  type: "image" | "video"; state: string; model: string; external_job_id: string | null;
+  type: "image" | "video" | "copy" | "qa"; state: string; model: string; external_job_id: string | null;
   attempt: number; max_attempts: number; progress: number; input: Record<string, unknown>; output: Record<string, unknown>;
 };
 type Credentials = { client_email: string; private_key: string };
@@ -56,30 +57,35 @@ async function generateCreativeBrief(job: Job, token: string) {
   const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
   const model = Deno.env.get("CREATIVE_GEMINI_MODEL") || Deno.env.get("STRATEGY_GEMINI_MODEL") || "gemini-2.5-flash";
   const result = await vertex(`projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`, token, {
-    contents: [{ role: "user", parts: [{ text: creativeBriefPrompt(job) }] }],
+    contents: [{ role: "user", parts: [{ text: creativeBriefPrompt({ type: job.type === "video" ? "video" : "image", input: job.input }) }] }],
     generationConfig: { responseMimeType: "application/json", temperature: 0.85, maxOutputTokens: 8192 },
   });
   const text = (result.candidates?.[0]?.content?.parts || []).map((part: { text?: string }) => part.text || "").join("");
   return parseCreativeBrief(text);
 }
 
-async function savePlatformCopy(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief) {
+async function savePlatformCopy(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief, mediaType: "image" | "video" = job.type === "video" ? "video" : "image") {
   const platforms = ((job.input?.strategy as Record<string, unknown> | undefined)?.platforms || []) as string[];
-  const format = job.type === "video" ? "short_video" : "image";
+  const format = mediaType === "video" ? "short_video" : "image";
   for (const platform of platforms) {
     const variant = await db.from("platform_variants").upsert({
       organization_id: job.organization_id, content_item_id: job.content_item_id, platform, format,
-      status: "ready", aspect_ratio: job.type === "video" ? "9:16" : "4:5", duration_seconds: job.type === "video" ? 8 : null,
+      status: "ready", aspect_ratio: mediaType === "video" ? "9:16" : "4:5", duration_seconds: mediaType === "video" ? 8 : null,
       selected_media_asset_id: assetId, platform_config: { generatedBy: "n8n-parity-v1" },
     }, { onConflict: "content_item_id,platform" }).select("id").single();
     if (variant.error) throw new Error(`Platform variant failed: ${variant.error.message}`);
     const hashtags = brief.social_post.hashtags?.[platform] || [];
-    const copy = await db.from("post_copies").upsert({
-      organization_id: job.organization_id, platform_variant_id: variant.data.id, locale: "en", version: 1, is_selected: true,
+    const { data: priorCopies, error: priorCopiesError } = await db.from("post_copies").select("version").eq("platform_variant_id", variant.data.id).eq("locale", "en").order("version", { ascending: false }).limit(1);
+    if (priorCopiesError) throw new Error(`Platform copy version lookup failed: ${priorCopiesError.message}`);
+    const version = (priorCopies?.[0]?.version || 0) + 1;
+    const deselect = await db.from("post_copies").update({ is_selected: false }).eq("platform_variant_id", variant.data.id).eq("locale", "en").eq("is_selected", true);
+    if (deselect.error) throw new Error(`Platform copy selection failed: ${deselect.error.message}`);
+    const copy = await db.from("post_copies").insert({
+      organization_id: job.organization_id, platform_variant_id: variant.data.id, locale: "en", version, is_selected: true,
       headline: brief.text_overlay.headline.text, subhead: brief.text_overlay.subhead.text,
       caption: brief.social_post.caption, hashtags, call_to_action: brief.text_overlay.cta.text,
       title: platform === "youtube" ? brief.social_post.titles?.youtube : platform === "tiktok" ? brief.social_post.titles?.tiktok : null,
-    }, { onConflict: "platform_variant_id,locale,version" });
+    });
     if (copy.error) throw new Error(`Platform copy failed: ${copy.error.message}`);
   }
 }
@@ -103,6 +109,18 @@ async function storeAsset(db: DatabaseClient, job: Job, bytes: Uint8Array, mimeT
   return existing.data.id as string;
 }
 
+async function completeQa(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief, media: { mimeType: string; bytes: number; width?: number | null; height?: number | null; durationSeconds?: number | null }) {
+  const revision = Number(job.input?.contentRevision);
+  if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("Generation job is missing its content revision");
+  const checks = runQualityChecks({ ...job, type: media.mimeType.startsWith("video/") ? "video" : "image" }, brief, media);
+  const result = await db.rpc("complete_content_qa", {
+    p_content_item_id: job.content_item_id, p_expected_revision: revision,
+    p_media_asset_id: assetId, p_checks: checks,
+  });
+  if (result.error) throw new Error(`Quality gate failed: ${result.error.message}`);
+  return checks;
+}
+
 async function generateImage(db: DatabaseClient, job: Job, worker: string, token: string) {
   const project = env("GOOGLE_CLOUD_PROJECT"); const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
   const model = job.model || Deno.env.get("IMAGE_GEMINI_MODEL") || "gemini-3.1-flash-image";
@@ -114,7 +132,40 @@ async function generateImage(db: DatabaseClient, job: Job, worker: string, token
   if (!part?.inlineData?.data) throw new Error("Gemini returned no image data");
   const bytes = decodeBase64(part.inlineData.data); const assetId = await storeAsset(db, job, bytes, part.inlineData.mimeType || "image/png", result.responseId);
   await savePlatformCopy(db, job, assetId, brief);
-  await checkpoint(db, job, worker, "media_ready", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief });
+  const qaChecks = await completeQa(db, job, assetId, brief, { mimeType: part.inlineData.mimeType || "image/png", bytes: bytes.byteLength });
+  await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief, qaChecks });
+}
+
+async function generateCopy(db: DatabaseClient, job: Job, worker: string, token: string) {
+  const sourceId = typeof job.input?.sourceMediaAssetId === "string" ? job.input.sourceMediaAssetId : "";
+  if (!sourceId) throw new Error("Copy-only revision is missing its source media asset");
+  const asset = await db.from("media_assets").select("id,mime_type,file_size_bytes,width,height,duration_seconds").eq("id", sourceId).eq("content_item_id", job.content_item_id).eq("organization_id", job.organization_id).eq("status", "ready").maybeSingle();
+  if (asset.error || !asset.data) throw new Error("The source media asset is no longer available for a copy-only revision");
+  const brief = await generateCreativeBrief(job, token);
+  await savePlatformCopy(db, job, asset.data.id, brief, asset.data.mime_type?.startsWith("video/") ? "video" : "image");
+  const qaChecks = await completeQa(db, job, asset.data.id, brief, {
+    mimeType: asset.data.mime_type || "image/png", bytes: Number(asset.data.file_size_bytes || 0),
+    width: asset.data.width, height: asset.data.height,
+    durationSeconds: asset.data.duration_seconds === null ? null : Number(asset.data.duration_seconds),
+  });
+  await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: asset.data.id, creativeBrief: brief, qaChecks, regenerationMode: "copy" });
+}
+
+async function runManualCopyQa(db: DatabaseClient, job: Job, worker: string) {
+  const sourceId = typeof job.input?.sourceMediaAssetId === "string" ? job.input.sourceMediaAssetId : "";
+  const platform = typeof job.input?.editedPlatform === "string" ? job.input.editedPlatform : "";
+  if (!sourceId || !platform) throw new Error("Manual copy QA is missing its source context");
+  const [asset, variant] = await Promise.all([
+    db.from("media_assets").select("id,mime_type,file_size_bytes,width,height,duration_seconds").eq("id",sourceId).eq("content_item_id",job.content_item_id).eq("status","ready").single(),
+    db.from("platform_variants").select("post_copies(headline,subhead,caption,hashtags,call_to_action,title,is_selected,version)").eq("content_item_id",job.content_item_id).eq("platform",platform).single(),
+  ]);
+  if (asset.error || variant.error || !asset.data || !variant.data) throw new Error("Manual copy QA resources are unavailable");
+  const copy = [...(variant.data.post_copies || [])].sort((a: {is_selected:boolean;version:number},b: {is_selected:boolean;version:number}) => Number(b.is_selected)-Number(a.is_selected)||b.version-a.version)[0];
+  if (!copy) throw new Error("Manual copy QA found no selected copy");
+  const brief: CreativeBrief = { media_prompt:"existing media", negative_prompt:"", audio_cue:"", text_overlay:{ layout:"bottom_minimal", headline:{text:copy.headline||"",in_time:0.5,out_time:5.5}, subhead:{text:copy.subhead||"",in_time:2.2,out_time:6.5}, cta:{text:copy.call_to_action||"",in_time:6,out_time:8} }, social_post:{ caption:copy.caption||"", hashtags:{[platform]:copy.hashtags||[]}, titles:{youtube:platform==="youtube"?(copy.title||""):"",tiktok:platform==="tiktok"?(copy.title||""):""} } };
+  const media = { mimeType:asset.data.mime_type||"image/png", bytes:Number(asset.data.file_size_bytes||0), width:asset.data.width, height:asset.data.height, durationSeconds:asset.data.duration_seconds===null?null:Number(asset.data.duration_seconds) };
+  const qaChecks = await completeQa(db,job,asset.data.id,brief,media);
+  await checkpoint(db,job,worker,"qa_complete",100,"succeeded",{mediaAssetId:asset.data.id,qaChecks,regenerationMode:"manual_copy"});
 }
 
 async function downloadGcs(uri: string, token: string) {
@@ -203,18 +254,21 @@ async function handleVideo(db: DatabaseClient, job: Job, worker: string, token: 
   const video = await composeVideo(db, job, rawVideo, brief);
   const assetId = await recordVideoAsset(db, job, video.path, video.bytes);
   await savePlatformCopy(db, job, assetId, brief);
-  await checkpoint(db, job, worker, "media_ready", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief, musicUrl: selectMusic(brief, job.id) });
+  const qaChecks = await completeQa(db, job, assetId, brief, { mimeType: "video/mp4", bytes: video.bytes, width: 1080, height: 1920, durationSeconds: 8 });
+  await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief, musicUrl: selectMusic(brief, job.id), qaChecks });
   if (gcsUri) await removeGcs(gcsUri, token);
 }
 
 async function normalizeQueuedModel(db: DatabaseClient, job: Job) {
   if (job.external_job_id) return;
+  if (job.type === "qa") return;
   const configured = job.type === "image"
     ? (Deno.env.get("IMAGE_GEMINI_MODEL") || "gemini-3.1-flash-image")
-    : (Deno.env.get("VEO_MODEL") || "veo-3.1-generate-001");
+    : job.type === "video" ? (Deno.env.get("VEO_MODEL") || "veo-3.1-generate-001")
+      : (Deno.env.get("CREATIVE_GEMINI_MODEL") || Deno.env.get("STRATEGY_GEMINI_MODEL") || "gemini-2.5-flash");
   const obsolete = job.type === "image"
     ? job.model === "gemini-3.1-flash-image-preview"
-    : job.model === "veo-3.0-generate-001" || job.model === "veo-3.1-generate-preview";
+    : job.type === "video" && (job.model === "veo-3.0-generate-001" || job.model === "veo-3.1-generate-preview");
   if (!obsolete || job.model === configured) return;
   const updated = await db.from("generation_jobs").update({ model: configured }).eq("id", job.id);
   if (updated.error) console.warn("job_model_update_failed", { jobId: job.id, message: updated.error.message });
@@ -240,10 +294,14 @@ Deno.serve(async (request) => {
   console.log("job_claimed", { jobId: job.id, type: job.type, attempt: job.attempt, external: !!job.external_job_id });
   try {
     await normalizeQueuedModel(db, job);
-    const token = await accessToken();
-    if (job.type === "image") await generateImage(db, job, worker, token);
-    else if (job.type === "video") await handleVideo(db, job, worker, token);
-    else throw new Error(`Unsupported generation type: ${job.type}`);
+    if (job.type === "qa") await runManualCopyQa(db,job,worker);
+    else {
+      const token = await accessToken();
+      if (job.type === "image") await generateImage(db, job, worker, token);
+      else if (job.type === "video") await handleVideo(db, job, worker, token);
+      else if (job.type === "copy") await generateCopy(db, job, worker, token);
+      else throw new Error(`Unsupported generation type: ${job.type}`);
+    }
     console.log("job_checkpointed", { jobId: job.id });
     return json({ ok: true, claimed: true, jobId: job.id });
   } catch (error) {
