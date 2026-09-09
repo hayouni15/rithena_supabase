@@ -8,6 +8,7 @@ export type CreativeBrief = {
     cta: { text: string; in_time: number; out_time: number };
   };
   audio_cue: string;
+  carousel_slides?: Array<{ headline: string; body: string; media_prompt: string }>;
   social_post: {
     caption: string;
     hashtags: Record<string, string[]>;
@@ -22,7 +23,9 @@ export function creativeBriefPrompt(job: BriefJob) {
   const strategy = input.strategy || {};
   const brandBrain = input.brandBrain || {};
   const regenerationDirection = typeof input.regenerationDirection === "string" ? input.regenerationDirection.trim() : "";
-  const medium = job.type === "video" ? "one continuous 8-second vertical 9:16 video" : "one 1080x1350 4:5 portrait image";
+  const contentFormat = String((input as Record<string, unknown>).contentFormat || "");
+  const carousel = contentFormat === "carousel";
+  const medium = job.type === "video" ? "one continuous 8-second vertical 9:16 video" : carousel ? "a coherent four-slide 1080x1350 social carousel" : "one 1080x1350 4:5 portrait image";
   return `You are a senior commercial producer, art director, and social copywriter. Create a production-ready brief for ${medium}.
 
 BRAND BRAIN (the only source of business truth):
@@ -49,6 +52,12 @@ ${job.type === "video" ? `VIDEO DIRECTION
 - Use photorealistic cinematic lighting and stable geometry. No cuts, scene changes, dialogue, narrator, lip movement, or generated audio.
 - The media_prompt must not ask Veo to render text, logos, signs, screens, UI, subtitles, captions, or writing. All words are added later.
 - End the media_prompt with: Vertical 9:16 framing, 8 seconds, photorealistic cinematic quality, shallow depth of field, stable geometry, no camera shake, smooth continuous motion, silent video with no audio, no text or writing of any kind in frame.
+` : carousel ? `CAROUSEL DIRECTION
+- Return exactly four carousel_slides. Slide 1 is a strong cover; slides 2 and 3 develop the useful idea; slide 4 concludes with the CTA.
+- Every slide needs a distinct composition and purpose while sharing the same subject world, palette, lighting, typography, and visual identity.
+- Each slide headline is 2-6 words and each body is at most 16 words. Do not repeat the same wording or visual on multiple slides.
+- Each media_prompt must fully describe that slide and instruct the image model to render only its exact headline and body with correct spelling.
+- Use the whole 4:5 canvas with mobile-safe margins. Keep all text at least 8% from every edge.
 ` : `IMAGE DIRECTION
 - Use the whole 4:5 canvas as one seamless composition with deliberate negative space and mobile-safe margins.
 - Render the exact headline, subhead, and CTA from text_overlay as clean, correctly spelled, high-contrast editorial typography integrated into the scene. Do not render any other words.
@@ -79,6 +88,12 @@ Return only valid JSON with this exact shape:
     "cta": { "text": "", "in_time": 6, "out_time": 8 }
   },
   "audio_cue": "",
+  "carousel_slides": ${carousel ? `[
+    { "headline": "", "body": "", "media_prompt": "" },
+    { "headline": "", "body": "", "media_prompt": "" },
+    { "headline": "", "body": "", "media_prompt": "" },
+    { "headline": "", "body": "", "media_prompt": "" }
+  ]` : "[]"},
   "social_post": {
     "caption": "",
     "hashtags": { "instagram": [], "facebook": [], "linkedin": [], "tiktok": [], "youtube": [] },

@@ -52,6 +52,15 @@ function savedBrief(job: Job) {
   return value && typeof value === "object" ? value as CreativeBrief : null;
 }
 
+async function contentFormat(db: DatabaseClient, job: Job) {
+  const supplied = job.input?.contentFormat;
+  if (typeof supplied === "string" && ["image", "carousel", "short_video", "text"].includes(supplied)) return supplied;
+  const result = await db.from("content_items").select("format").eq("id", job.content_item_id).eq("organization_id", job.organization_id).single();
+  if (result.error || !result.data?.format) throw new Error("The planned content format is unavailable");
+  job.input = { ...job.input, contentFormat: result.data.format };
+  return String(result.data.format);
+}
+
 async function generateCreativeBrief(job: Job, token: string) {
   const project = env("GOOGLE_CLOUD_PROJECT");
   const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
@@ -64,13 +73,13 @@ async function generateCreativeBrief(job: Job, token: string) {
   return parseCreativeBrief(text);
 }
 
-async function savePlatformCopy(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief, mediaType: "image" | "video" = job.type === "video" ? "video" : "image") {
+async function savePlatformCopy(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief, format: string) {
   const platforms = ((job.input?.strategy as Record<string, unknown> | undefined)?.platforms || []) as string[];
-  const format = mediaType === "video" ? "short_video" : "image";
+  const video = format === "short_video";
   for (const platform of platforms) {
     const variant = await db.from("platform_variants").upsert({
       organization_id: job.organization_id, content_item_id: job.content_item_id, platform, format,
-      status: "ready", aspect_ratio: mediaType === "video" ? "9:16" : "4:5", duration_seconds: mediaType === "video" ? 8 : null,
+      status: "ready", aspect_ratio: video ? "9:16" : "4:5", duration_seconds: video ? 8 : null,
       selected_media_asset_id: assetId, platform_config: { generatedBy: "n8n-parity-v1" },
     }, { onConflict: "content_item_id,platform" }).select("id").single();
     if (variant.error) throw new Error(`Platform variant failed: ${variant.error.message}`);
@@ -95,12 +104,12 @@ async function checkpoint(db: DatabaseClient, job: Job, worker: string, stage: s
   if (error) throw new Error(`Checkpoint failed: ${error.message}`);
 }
 
-async function storeAsset(db: DatabaseClient, job: Job, bytes: Uint8Array, mimeType: string, providerId?: string) {
+async function storeAsset(db: DatabaseClient, job: Job, bytes: Uint8Array, mimeType: string, providerId?: string, options: { suffix?: string; assetType?: string; metadata?: Record<string, unknown> } = {}) {
   const extension = mimeType === "video/mp4" ? "mp4" : mimeType === "image/jpeg" ? "jpg" : mimeType === "image/webp" ? "webp" : "png";
-  const path = `${job.organization_id}/${job.content_item_id}/${job.id}.${extension}`;
+  const path = `${job.organization_id}/${job.content_item_id}/${job.id}${options.suffix || ""}.${extension}`;
   const upload = await db.storage.from("creative-media").upload(path, bytes, { contentType: mimeType, upsert: false });
   if (upload.error && !upload.error.message.toLowerCase().includes("already exists")) throw new Error(`Storage upload failed: ${upload.error.message}`);
-  const asset = { organization_id: job.organization_id, content_item_id: job.content_item_id, asset_type: job.type, origin: "generated", status: "ready", storage_bucket: "creative-media", storage_path: path, mime_type: mimeType, file_size_bytes: bytes.byteLength, provider: "google-vertex-ai", provider_asset_id: providerId || null, metadata: { model: job.model, generationJobId: job.id, pipeline: strategy(job).pipeline } };
+  const asset = { organization_id: job.organization_id, content_item_id: job.content_item_id, asset_type: options.assetType || job.type, origin: "generated", status: "ready", storage_bucket: "creative-media", storage_path: path, mime_type: mimeType, file_size_bytes: bytes.byteLength, provider: "google-vertex-ai", provider_asset_id: providerId || null, metadata: { model: job.model, generationJobId: job.id, pipeline: strategy(job).pipeline, ...(options.metadata || {}) } };
   const inserted = await db.from("media_assets").insert(asset).select("id").maybeSingle();
   if (inserted.error && inserted.error.code !== "23505") throw new Error(`Media record failed: ${inserted.error.message}`);
   if (inserted.data) return inserted.data.id as string;
@@ -122,6 +131,8 @@ async function completeQa(db: DatabaseClient, job: Job, assetId: string, brief: 
 }
 
 async function generateImage(db: DatabaseClient, job: Job, worker: string, token: string) {
+  const format = await contentFormat(db, job);
+  if (format === "carousel") return generateCarousel(db, job, worker, token);
   const project = env("GOOGLE_CLOUD_PROJECT"); const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
   const model = job.model || Deno.env.get("IMAGE_GEMINI_MODEL") || "gemini-3.1-flash-image";
   const brief = savedBrief(job) || await generateCreativeBrief(job, token);
@@ -131,9 +142,46 @@ async function generateImage(db: DatabaseClient, job: Job, worker: string, token
   const part = result.candidates?.[0]?.content?.parts?.find((candidate: Record<string, unknown>) => (candidate.inlineData as { mimeType?: string } | undefined)?.mimeType?.startsWith("image/"));
   if (!part?.inlineData?.data) throw new Error("Gemini returned no image data");
   const bytes = decodeBase64(part.inlineData.data); const assetId = await storeAsset(db, job, bytes, part.inlineData.mimeType || "image/png", result.responseId);
-  await savePlatformCopy(db, job, assetId, brief);
+  await savePlatformCopy(db, job, assetId, brief, format);
   const qaChecks = await completeQa(db, job, assetId, brief, { mimeType: part.inlineData.mimeType || "image/png", bytes: bytes.byteLength });
   await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief, qaChecks });
+}
+
+async function generateCarousel(db: DatabaseClient, job: Job, worker: string, token: string) {
+  const project = env("GOOGLE_CLOUD_PROJECT"); const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
+  const model = job.model || Deno.env.get("IMAGE_GEMINI_MODEL") || "gemini-3.1-flash-image";
+  const brief = savedBrief(job) || await generateCreativeBrief(job, token);
+  const slides = brief.carousel_slides;
+  if (!Array.isArray(slides) || slides.length !== 4 || slides.some((slide) => !slide.headline || !slide.media_prompt)) throw new Error("Creative director returned an incomplete four-slide carousel");
+  const completed = Array.isArray(job.output?.carouselAssetIds) ? job.output.carouselAssetIds.filter((id): id is string => typeof id === "string") : [];
+  const index = completed.length;
+  if (index >= slides.length) throw new Error("Carousel checkpoint contains too many slides");
+  const slide = slides[index];
+  const suffix = `-slide-${index + 1}`;
+  const extensionCandidates = ["png", "jpg", "webp"];
+  let assetId = ""; let mimeType = "image/png"; let byteLength = 0;
+  for (const extension of extensionCandidates) {
+    const path = `${job.organization_id}/${job.content_item_id}/${job.id}${suffix}.${extension}`;
+    const existing = await db.from("media_assets").select("id,mime_type,file_size_bytes").eq("storage_bucket", "creative-media").eq("storage_path", path).maybeSingle();
+    if (existing.error) throw new Error(`Carousel resume lookup failed: ${existing.error.message}`);
+    if (existing.data) { assetId = existing.data.id; mimeType = existing.data.mime_type || mimeType; byteLength = Number(existing.data.file_size_bytes || 0); break; }
+  }
+  if (!assetId) {
+    const prompt = `${slide.media_prompt}\n\nThis is slide ${index + 1} of 4 in one coherent carousel. Render only this exact copy with correct spelling: headline “${slide.headline}”; supporting line “${slide.body || ""}”. Maintain consistent brand palette, subject, lighting, typography, and visual language across the series. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
+    const result = await vertex(`projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`, token, { contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig: { responseModalities: ["TEXT", "IMAGE"], imageConfig: { aspectRatio: "4:5" } } });
+    const part = result.candidates?.[0]?.content?.parts?.find((candidate: Record<string, unknown>) => (candidate.inlineData as { mimeType?: string } | undefined)?.mimeType?.startsWith("image/"));
+    if (!part?.inlineData?.data) throw new Error(`Gemini returned no image data for carousel slide ${index + 1}`);
+    const bytes = decodeBase64(part.inlineData.data); mimeType = part.inlineData.mimeType || "image/png"; byteLength = bytes.byteLength;
+    assetId = await storeAsset(db, job, bytes, mimeType, result.responseId, { suffix, assetType: "carousel_slide", metadata: { slideIndex: index + 1, slideCount: slides.length } });
+  }
+  const carouselAssetIds = [...completed, assetId];
+  if (carouselAssetIds.length < slides.length) {
+    await checkpoint(db, job, worker, `carousel_slide_${index + 1}_complete`, 15 + carouselAssetIds.length * 18, "waiting_external", { creativeBrief: brief, carouselAssetIds }, undefined, 1);
+    return;
+  }
+  await savePlatformCopy(db, job, carouselAssetIds[0], brief, "carousel");
+  const qaChecks = await completeQa(db, job, assetId, brief, { mimeType, bytes: byteLength });
+  await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: carouselAssetIds[0], carouselAssetIds, creativeBrief: brief, qaChecks });
 }
 
 async function generateCopy(db: DatabaseClient, job: Job, worker: string, token: string) {
@@ -142,7 +190,7 @@ async function generateCopy(db: DatabaseClient, job: Job, worker: string, token:
   const asset = await db.from("media_assets").select("id,mime_type,file_size_bytes,width,height,duration_seconds").eq("id", sourceId).eq("content_item_id", job.content_item_id).eq("organization_id", job.organization_id).eq("status", "ready").maybeSingle();
   if (asset.error || !asset.data) throw new Error("The source media asset is no longer available for a copy-only revision");
   const brief = await generateCreativeBrief(job, token);
-  await savePlatformCopy(db, job, asset.data.id, brief, asset.data.mime_type?.startsWith("video/") ? "video" : "image");
+  await savePlatformCopy(db, job, asset.data.id, brief, await contentFormat(db, job));
   const qaChecks = await completeQa(db, job, asset.data.id, brief, {
     mimeType: asset.data.mime_type || "image/png", bytes: Number(asset.data.file_size_bytes || 0),
     width: asset.data.width, height: asset.data.height,
@@ -253,7 +301,7 @@ async function handleVideo(db: DatabaseClient, job: Job, worker: string, token: 
   const brief = savedBrief(job); if (!brief) throw new Error("The saved creative brief is missing");
   const video = await composeVideo(db, job, rawVideo, brief);
   const assetId = await recordVideoAsset(db, job, video.path, video.bytes);
-  await savePlatformCopy(db, job, assetId, brief);
+  await savePlatformCopy(db, job, assetId, brief, "short_video");
   const qaChecks = await completeQa(db, job, assetId, brief, { mimeType: "video/mp4", bytes: video.bytes, width: 1080, height: 1920, durationSeconds: 8 });
   await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief, musicUrl: selectMusic(brief, job.id), qaChecks });
   if (gcsUri) await removeGcs(gcsUri, token);
