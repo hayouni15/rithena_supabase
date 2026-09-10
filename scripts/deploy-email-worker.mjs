@@ -12,6 +12,10 @@ const cronSecret = required("CRON_SECRET");
 const resendApiKey = required("RESEND_API_KEY");
 const fromEmail = required("RESEND_FROM_EMAIL");
 const appUrl = required("APP_URL", process.env.NEXT_PUBLIC_SITE_URL);
+const parsedAppUrl = new URL(appUrl);
+if (parsedAppUrl.protocol !== "https:" || ["localhost", "127.0.0.1", "::1"].includes(parsedAppUrl.hostname)) {
+  throw new Error("APP_URL must be the public HTTPS production application URL.");
+}
 const replyTo = process.env.RESEND_REPLY_TO?.trim();
 const workerUrl = `https://${projectRef}.supabase.co/functions/v1/email-worker`;
 
