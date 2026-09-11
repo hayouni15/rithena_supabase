@@ -18,6 +18,8 @@
     "publishing:deploy:prod": "npx dotenv -e .env -e ../rithena/.env -- sh -c 'SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN npx supabase secrets set --project-ref $PROD_PROJECT_REF CRON_SECRET=$CRON_SECRET SOCIAL_CREDENTIALS_ENCRYPTION_KEY=$SOCIAL_CREDENTIALS_ENCRYPTION_KEY INSTAGRAM_API_VERSION=$INSTAGRAM_API_VERSION && SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN npx supabase functions deploy publish-worker --project-ref $PROD_PROJECT_REF --no-verify-jwt && SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN SUPABASE_PROJECT_REF=$PROD_PROJECT_REF node scripts/configure-publish-cron.mjs'",
     "email:deploy:prod": "npx dotenv -e .env -e ../rithena/.env -- node scripts/deploy-email-worker.mjs",
     "email:verify:prod": "npx dotenv -e .env -e ../rithena/.env -- node scripts/verify-email-deployment.mjs"
+    ,"analytics:deploy:prod": "npx dotenv -e .env -e ../rithena/.env -- node scripts/deploy-analytics-worker.mjs",
+    "analytics:verify:prod": "npx dotenv -e .env -e ../rithena/.env -- node scripts/verify-analytics-deployment.mjs"
   },
   "keywords": [],
   "author": "",

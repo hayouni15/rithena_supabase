@@ -1,0 +1,6 @@
+const required=(name)=>{const value=process.env[name]?.trim();if(!value)throw new Error(`${name} is required to verify analytics.`);return value;};
+const token=required("PROD_ACCESS_TOKEN"),project=required("PROD_PROJECT_REF");
+const query=`select exists(select 1 from cron.job where jobname='rithena-analytics-worker' and schedule='0 5 * * *') as cron_ready, exists(select 1 from vault.secrets where name='rithena_analytics_worker_url') as worker_url_ready, to_regclass('public.account_metric_snapshots') is not null as account_snapshots_ready, to_regprocedure('public.respond_to_performance_recommendation(uuid,public.recommendation_status)') is not null as recommendation_response_ready;`;
+const response=await fetch(`https://api.supabase.com/v1/projects/${encodeURIComponent(project)}/database/query`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify({query})});
+if(!response.ok)throw new Error(`Analytics verification failed (${response.status}): ${await response.text()}`);
+const [result]=await response.json();const checks=["cron_ready","worker_url_ready","account_snapshots_ready","recommendation_response_ready"];for(const check of checks)if(result?.[check]!==true)throw new Error(`Analytics verification failed: ${check}`);console.log("Analytics deployment verified:",checks.join(", "));
