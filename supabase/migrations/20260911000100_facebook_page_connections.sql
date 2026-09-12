@@ -1,4 +1,4 @@
-create table private.facebook_attempts (
+create table if not exists private.facebook_attempts (
  id uuid primary key, user_id uuid not null references auth.users(id) on delete cascade,
  brand_id uuid not null references public.brands(id) on delete cascade,
  connection_id uuid not null, reconnect boolean not null,
@@ -7,7 +7,7 @@ create table private.facebook_attempts (
  expires_at timestamptz not null default now() + interval '10 minutes',
  destination jsonb, ciphertext text, issued_at timestamptz, token_expires_at timestamptz, scopes text[]
 );
-create table private.facebook_credentials (
+create table if not exists private.facebook_credentials (
  connection_id uuid primary key references public.social_connections(id) on delete cascade,
  ciphertext text not null, issued_at timestamptz not null,
  revision uuid not null default gen_random_uuid(), lease_id uuid, lease_until timestamptz
