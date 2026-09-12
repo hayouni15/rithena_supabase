@@ -2,7 +2,7 @@ import { createClient } from "npm:@supabase/supabase-js@2";
 
 type Json = Record<string, unknown>;
 type Job = { id:string; organization_id:string; content_item_id:string; platform_variant_id:string; social_connection_id:string; content_revision:number; state:string; provider_job_id:string|null; provider_payload:Json; attempt:number; max_attempts:number };
-type Credential = { ciphertext:string; organizationId:string; brandId:string; connectionId:string; accountId:string };
+type Credential = { ciphertext:string; organizationId:string; brandId:string; connectionId:string; accountId:string; platform:"instagram"|"facebook" };
 // deno-lint-ignore no-explicit-any
 type Db = any;
 
@@ -17,7 +17,7 @@ class PublishError extends Error {
 
 async function decrypt(envelope:string,credential:Credential){
   const [version,iv,tag,ciphertext,extra]=envelope.split(".");
-  if(version!=="v1"||!iv||!tag||!ciphertext||extra!==undefined) throw new PublishError("credential_invalid","Instagram credentials could not be read. Reconnect Instagram.",false);
+  if(version!=="v1"||!iv||!tag||!ciphertext||extra!==undefined) throw new PublishError("credential_invalid",`${credential.platform === "facebook" ? "Facebook" : "Instagram"} credentials could not be read. Reconnect the account.`,false);
   const keyBytes=fromBase64(env("SOCIAL_CREDENTIALS_ENCRYPTION_KEY"));
   if(keyBytes.length!==32) throw new Error("SOCIAL_CREDENTIALS_ENCRYPTION_KEY must decode to 32 bytes");
   const key=await crypto.subtle.importKey("raw",keyBytes,"AES-GCM",false,["decrypt"]);
@@ -25,7 +25,7 @@ async function decrypt(envelope:string,credential:Credential){
   const combined=new Uint8Array(encrypted.length+authTag.length); combined.set(encrypted); combined.set(authTag,encrypted.length);
   const aad=new TextEncoder().encode(JSON.stringify(["rithena:social-credentials:v1",credential.organizationId,credential.brandId,credential.connectionId]));
   try { return new TextDecoder().decode(await crypto.subtle.decrypt({name:"AES-GCM",iv:fromBase64Url(iv),additionalData:aad,tagLength:128},key,combined)); }
-  catch { throw new PublishError("credential_invalid","Instagram credentials could not be read. Reconnect Instagram.",false); }
+  catch { throw new PublishError("credential_invalid",`${credential.platform === "facebook" ? "Facebook" : "Instagram"} credentials could not be read. Reconnect the account.`,false); }
 }
 
 function graphVersion(){ const version=env("INSTAGRAM_API_VERSION"); if(!/^v\d+\.0$/.test(version)) throw new Error("INSTAGRAM_API_VERSION must look like v24.0"); return version; }
@@ -47,7 +47,7 @@ async function graph(path:string,token:string,init:RequestInit={},ambiguous=fals
 }
 
 async function checkpoint(db:Db,job:Job,worker:string,state:string,options:{providerId?:string;payload?:Json;retryAfter?:number;code?:string;message?:string;remoteId?:string;remoteUrl?:string}={}){
-  const result=await db.rpc("checkpoint_instagram_publish_job",{p_job_id:job.id,p_worker_id:worker,p_state:state,p_provider_job_id:options.providerId||null,p_provider_payload:options.payload||{},p_retry_after_seconds:options.retryAfter||null,p_error_code:options.code||null,p_error_message:options.message||null,p_remote_post_id:options.remoteId||null,p_remote_post_url:options.remoteUrl||null});
+  const result=await db.rpc("checkpoint_social_publish_job",{p_job_id:job.id,p_worker_id:worker,p_state:state,p_provider_job_id:options.providerId||null,p_provider_payload:options.payload||{},p_retry_after_seconds:options.retryAfter||null,p_error_code:options.code||null,p_error_message:options.message||null,p_remote_post_id:options.remoteId||null,p_remote_post_url:options.remoteUrl||null});
   if(result.error) throw new Error(`Publish checkpoint failed: ${result.error.message}`);
 }
 
@@ -82,6 +82,32 @@ async function signedUrl(db:Db,asset:{storage_bucket:string;storage_path:string}
   const signed=await db.storage.from(asset.storage_bucket).createSignedUrl(asset.storage_path,21600);
   if(signed.error||!signed.data?.signedUrl) throw new PublishError("media_delivery_failed","The approved media could not be prepared for Instagram.",true);
   return signed.data.signedUrl as string;
+}
+
+function facebookVersion(){const version=env("FACEBOOK_API_VERSION");if(!/^v\d+\.0$/.test(version))throw new Error("FACEBOOK_API_VERSION must look like v24.0");return version;}
+async function facebookGraph(path:string,token:string,init:RequestInit={},ambiguous=false):Promise<Json>{
+  let response:Response;
+  try{response=await fetch(`https://graph.facebook.com/${facebookVersion()}/${path}`,{...init,headers:{authorization:`Bearer ${token}`,...init.headers},signal:AbortSignal.timeout(30_000)});}
+  catch{throw new PublishError(ambiguous?"publish_outcome_unknown":"facebook_unavailable",ambiguous?"Facebook received the publish request, but its result could not be confirmed. Check the Page before retrying to avoid a duplicate post.":"Facebook could not be reached. Rithena will retry automatically.",!ambiguous);}
+  let body:Json={};try{body=await response.json() as Json;}catch{/* classified below */}
+  if(!response.ok){const error=(body.error&&typeof body.error==="object"?body.error:body) as Json;const code=Number(error.code||0);const subcode=Number(error.error_subcode||0);if(code===190)throw new PublishError(subcode===463?"facebook_expired":"facebook_revoked",subcode===463?"Facebook access expired. Reconnect the Page, then reschedule.":"Facebook access was removed. Reconnect the Page, then reschedule.",false);if(code===10||code===200||response.status===403)throw new PublishError("facebook_permissions","Facebook no longer allows publishing for this Page. Reconnect and grant Page publishing access.",false);if(response.status===429||response.status>=500)throw new PublishError("facebook_unavailable","Facebook is temporarily unavailable. Rithena will retry automatically.",true);throw new PublishError(`facebook_${code||response.status}`,String(error.message||"Facebook rejected this post.").slice(0,400),false);}
+  return body;
+}
+
+function facebookToken(decrypted:string,accountId:string){try{const stored=JSON.parse(decrypted) as {pageAccessTokens?:Record<string,string>};const token=stored.pageAccessTokens?.[accountId];if(!token)throw new Error();return token;}catch{throw new PublishError("credential_invalid","Facebook credentials could not be read. Reconnect Facebook.",false);}}
+
+async function runFacebook(db:Db,job:Job,worker:string,credential:Credential,token:string){
+  const source=await resources(db,job);const payload=job.provider_payload||{};
+  if(source.format==="video"||String(source.assets[0]?.mime_type||"").startsWith("video/")){
+    if(!payload.publishRequestedAt){await checkpoint(db,job,worker,"waiting_external",{payload:{stage:"publishing_video",publishRequestedAt:new Date().toISOString()},retryAfter:1});return;}
+    if(job.attempt>1)throw new PublishError("publish_outcome_unknown","A previous Facebook video publish request could not be confirmed. Check the Page before retrying.",false);
+    const url=await signedUrl(db,source.assets[0]);const result=await facebookGraph(`${credential.accountId}/videos`,token,{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({file_url:url,description:source.caption})},true);const id=typeof result.id==="string"?result.id:"";if(!id)throw new PublishError("publish_outcome_unknown","Facebook accepted the video but did not return its ID. Check the Page before retrying.",false);await checkpoint(db,job,worker,"succeeded",{payload:{stage:"published",remotePostId:id},remoteId:id});return;
+  }
+  const photoIds=Array.isArray(payload.photoIds)?payload.photoIds.filter((id):id is string=>typeof id==="string"):[];
+  if(photoIds.length<source.assets.length){const url=await signedUrl(db,source.assets[photoIds.length]);const result=await facebookGraph(`${credential.accountId}/photos`,token,{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({url,published:"false"})});const id=typeof result.id==="string"?result.id:"";if(!id)throw new PublishError("facebook_invalid_response","Facebook did not return an uploaded photo ID.",true);await checkpoint(db,job,worker,"waiting_external",{payload:{stage:"uploading_photos",photoIds:[...photoIds,id]},retryAfter:1});return;}
+  if(!payload.publishRequestedAt){await checkpoint(db,job,worker,"waiting_external",{payload:{stage:"publishing",photoIds,publishRequestedAt:new Date().toISOString()},retryAfter:1});return;}
+  const body=new URLSearchParams({message:source.caption});photoIds.forEach((id,index)=>body.set(`attached_media[${index}]`,JSON.stringify({media_fbid:id})));
+  const result=await facebookGraph(`${credential.accountId}/feed`,token,{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body},true);const id=typeof result.id==="string"?result.id:"";if(!id)throw new PublishError("publish_outcome_unknown","Facebook accepted the post but did not return its ID. Check the Page before retrying.",false);let permalink:string|undefined;try{const post=await facebookGraph(`${id}?fields=permalink_url`,token);if(typeof post.permalink_url==="string")permalink=post.permalink_url;}catch{/* publish succeeded */}await checkpoint(db,job,worker,"succeeded",{payload:{stage:"published",remotePostId:id,photoIds},remoteId:id,remoteUrl:permalink});
 }
 
 async function run(db:Db,job:Job,worker:string,credential:Credential,token:string){
@@ -132,14 +158,15 @@ Deno.serve(async(request)=>{
   if(claimed.error){console.error("publish_claim_failed",{message:claimed.error.message});return json({error:"Job claim failed"},500);}
   const job=claimed.data as Job|null; if(!job?.id) return json({ok:true,claimed:false});
   try {
-    const secret=await db.rpc("instagram_publish_credential",{p_job_id:job.id,p_worker_id:worker});
-    if(secret.error) throw new PublishError("instagram_expired","Instagram must be reconnected before this post can publish.",false);
-    const credential=secret.data as Credential; const token=await decrypt(credential.ciphertext,credential);
-    if(job.provider_payload?.stage==="publishing"&&job.provider_payload?.publishRequestedAt) await publishPrepared(db,job,worker,credential,token);
-    else await run(db,job,worker,credential,token);
+    const secret=await db.rpc("social_publish_credential",{p_job_id:job.id,p_worker_id:worker});
+    if(secret.error) throw new PublishError("credential_invalid","The social account must be reconnected before this post can publish.",false);
+    const credential=secret.data as Credential; const decrypted=await decrypt(credential.ciphertext,credential);
+    if(credential.platform==="facebook")await runFacebook(db,job,worker,credential,facebookToken(decrypted,credential.accountId));
+    else if(job.provider_payload?.stage==="publishing"&&job.provider_payload?.publishRequestedAt) await publishPrepared(db,job,worker,credential,decrypted);
+    else await run(db,job,worker,credential,decrypted);
     return json({ok:true,claimed:true,jobId:job.id});
   } catch(error){
-    const known=error instanceof PublishError; const code=known?error.code:"publisher_failed"; const message=(known?error.message:"Instagram publishing failed unexpectedly.").slice(0,500);
+    const known=error instanceof PublishError; const code=known?error.code:"publisher_failed"; const message=(known?error.message:"Social publishing failed unexpectedly.").slice(0,500);
     const retry=known&&error.retryable&&job.attempt<job.max_attempts;
     console.error("publish_failed",{jobId:job.id,attempt:job.attempt,code,message});
     try { await checkpoint(db,job,worker,retry?"retrying":"failed",{providerId:job.provider_job_id||undefined,payload:{stage:retry?"retry_scheduled":"failed"},retryAfter:retry?Math.min(900,15*2**Math.max(0,job.attempt-1)):undefined,code,message}); } catch(checkpointError){console.error("publish_failure_checkpoint_failed",{jobId:job.id,message:String(checkpointError)});}
