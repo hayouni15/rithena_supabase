@@ -1,0 +1,94 @@
+create table if not exists private.youtube_attempts (
+ id uuid primary key, user_id uuid not null references auth.users(id) on delete cascade,
+ brand_id uuid not null references public.brands(id) on delete cascade,
+ connection_id uuid not null, reconnect boolean not null,
+ state_hash text not null unique, browser_hash text not null,
+ phase text not null default 'pending' check (phase in ('pending','exchanging')),
+ expires_at timestamptz not null default now() + interval '10 minutes'
+);
+create table if not exists private.youtube_credentials (
+ connection_id uuid primary key references public.social_connections(id) on delete cascade,
+ ciphertext text not null, issued_at timestamptz not null,
+ revision uuid not null default gen_random_uuid(), lease_id uuid, lease_until timestamptz
+);
+alter table private.youtube_attempts enable row level security;
+alter table private.youtube_credentials enable row level security;
+revoke all on private.youtube_attempts, private.youtube_credentials from public,anon,authenticated;
+
+create or replace function public.youtube_connection_command(p_action text,p_user uuid,p_brand uuid,p_data jsonb default '{}')
+returns jsonb language plpgsql security definer set search_path='' as $$
+declare
+ b public.brands; a private.youtube_attempts; c public.social_connections;
+ secret private.youtube_credentials; connection uuid;
+begin
+ select * into b from public.brands where id=p_brand for update;
+ if b.id is null then raise exception 'Brand unavailable' using errcode='42501'; end if;
+ if p_user is null then
+  if p_action not in ('claim','finish') then raise exception 'User required' using errcode='42501'; end if;
+ elsif not exists(select 1 from public.organization_members where organization_id=b.organization_id and user_id=p_user) then
+  raise exception 'Membership required' using errcode='42501';
+ end if;
+ delete from private.youtube_attempts where brand_id=b.id and expires_at<=now();
+ if p_action='start' then
+  if length(p_data->>'stateHash')<>64 or length(p_data->>'browserHash')<>64 then raise exception 'Invalid state'; end if;
+  connection:=coalesce(nullif(p_data->>'connectionId','')::uuid,gen_random_uuid());
+  if p_data->>'connectionId' is not null then
+   select * into c from public.social_connections where id=connection and brand_id=b.id and platform='youtube';
+   if c.id is null then raise exception 'Connection unavailable' using errcode='42501'; end if;
+  end if;
+  delete from private.youtube_attempts where user_id=p_user and brand_id=b.id;
+  insert into private.youtube_attempts(id,user_id,brand_id,connection_id,reconnect,state_hash,browser_hash)
+   values((p_data->>'id')::uuid,p_user,b.id,connection,c.id is not null,p_data->>'stateHash',p_data->>'browserHash');
+  return '{}';
+ elsif p_action in ('consume','complete','cancel') then
+  select * into a from private.youtube_attempts where id=(p_data->>'id')::uuid and user_id=p_user and brand_id=b.id
+   and browser_hash=p_data->>'browserHash' and expires_at>now() for update;
+  if a.id is null then raise exception 'Connection attempt expired' using errcode='40001'; end if;
+  if p_action='cancel' then delete from private.youtube_attempts where id=a.id; return '{}';
+  elsif p_action='consume' then
+   if a.phase<>'pending' or a.state_hash<>p_data->>'stateHash' then raise exception 'Invalid or used state' using errcode='40001'; end if;
+   update private.youtube_attempts set phase='exchanging' where id=a.id;
+   return jsonb_build_object('connectionId',a.connection_id,'organizationId',b.organization_id);
+  end if;
+  if a.phase<>'exchanging' or p_data->>'ciphertext' is null
+   or not (p_data->'scopes' @> '["https://www.googleapis.com/auth/youtube.readonly","https://www.googleapis.com/auth/youtube.upload"]'::jsonb)
+   or (p_data->>'expiresAt')::timestamptz<=now() then raise exception 'Incomplete authorization'; end if;
+  if a.reconnect and not exists(select 1 from public.social_connections where id=a.connection_id and provider_account_id=p_data->'destination'->>'id') then
+   raise exception 'Reconnect the same YouTube channel' using errcode='22023';
+  end if;
+  if not a.reconnect and exists(select 1 from public.social_connections where brand_id=b.id and platform='youtube' and provider_account_id=p_data->'destination'->>'id') then
+   raise exception 'This channel already exists' using errcode='23505';
+  end if;
+  insert into public.social_connections(id,organization_id,brand_id,platform,provider_account_id,provider_account_name,provider_account_handle,status,scopes,credentials_reference,token_expires_at,last_validated_at,connected_by)
+  values(a.connection_id,b.organization_id,b.id,'youtube',p_data->'destination'->>'id',p_data->'destination'->>'title',coalesce(p_data->'destination'->>'handle',p_data->'destination'->>'title'),'connected',array(select jsonb_array_elements_text(p_data->'scopes')),a.connection_id::text,(p_data->>'expiresAt')::timestamptz,now(),p_user)
+  on conflict(id) do update set provider_account_name=excluded.provider_account_name,provider_account_handle=excluded.provider_account_handle,status='connected',scopes=excluded.scopes,credentials_reference=excluded.credentials_reference,token_expires_at=excluded.token_expires_at,last_validated_at=now(),last_error_code=null,last_error_message=null,connected_by=p_user;
+  insert into private.youtube_credentials(connection_id,ciphertext,issued_at) values(a.connection_id,p_data->>'ciphertext',(p_data->>'issuedAt')::timestamptz)
+  on conflict(connection_id) do update set ciphertext=excluded.ciphertext,issued_at=excluded.issued_at,revision=gen_random_uuid(),lease_id=null,lease_until=null;
+  delete from private.youtube_attempts where id=a.id; return '{}';
+ elsif p_action in ('disconnect','claim','finish') then
+  select * into c from public.social_connections where id=(p_data->>'connectionId')::uuid and brand_id=b.id and platform='youtube' for update;
+  if c.id is null then raise exception 'Connection unavailable' using errcode='42501'; end if;
+  if p_action='disconnect' then
+   delete from private.youtube_credentials where connection_id=c.id;
+   delete from private.youtube_attempts where brand_id=b.id;
+   update public.social_connections set status='revoked',credentials_reference=null,scopes='{}',token_expires_at=null,last_error_code='disconnected',last_error_message='Disconnected from Rithena. Reconnect to use this channel.' where id=c.id;
+   return '{}';
+  end if;
+  select * into secret from private.youtube_credentials where connection_id=c.id for update;
+  if secret.connection_id is null then raise exception 'Reconnect this channel' using errcode='40001'; end if;
+  if p_action='claim' then
+   if secret.lease_until>now() then raise exception 'Connection check already running' using errcode='40001'; end if;
+   update private.youtube_credentials set lease_id=gen_random_uuid(),lease_until=now()+interval '2 minutes' where connection_id=c.id returning * into secret;
+   return jsonb_build_object('ciphertext',secret.ciphertext,'organizationId',b.organization_id,'accountId',c.provider_account_id,'revision',secret.revision,'leaseId',secret.lease_id);
+  end if;
+  if secret.revision<>(p_data->>'revision')::uuid or secret.lease_id is distinct from (p_data->>'leaseId')::uuid or secret.lease_until<=now() then raise exception 'Connection changed during check' using errcode='40001'; end if;
+  if p_data->>'status' not in ('connected','expired','revoked','error') then raise exception 'Invalid health'; end if;
+  update public.social_connections set status=(p_data->>'status')::public.connection_status,last_validated_at=now(),last_error_code=p_data->>'errorCode',last_error_message=p_data->>'errorMessage',token_expires_at=coalesce((p_data->>'expiresAt')::timestamptz,token_expires_at) where id=c.id;
+  if p_data->>'ciphertext' is not null then update private.youtube_credentials set ciphertext=p_data->>'ciphertext',issued_at=now() where connection_id=c.id; end if;
+  update private.youtube_credentials set revision=gen_random_uuid(),lease_id=null,lease_until=null where connection_id=c.id;
+  return '{}';
+ end if;
+ raise exception 'Unknown connection operation';
+end $$;
+revoke all on function public.youtube_connection_command(text,uuid,uuid,jsonb) from public,anon,authenticated;
+grant execute on function public.youtube_connection_command(text,uuid,uuid,jsonb) to service_role;
