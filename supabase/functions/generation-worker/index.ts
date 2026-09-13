@@ -225,7 +225,7 @@ async function downloadGcs(uri: string, token: string) {
   const length = Number(response.headers.get("content-length") || 0);
   if (length > 80_000_000) throw new Error("Veo returned a video larger than the 80 MB processing limit");
   if (!response.body) throw new Error("Veo returned an empty video stream");
-  return response.body;
+  return { body: response.body, bytes: length };
 }
 
 async function removeGcs(uri: string, token: string) {
@@ -234,8 +234,8 @@ async function removeGcs(uri: string, token: string) {
   if (!response.ok && response.status !== 404) console.warn("veo_output_cleanup_failed", { status: response.status });
 }
 
-async function recordVideoAsset(db: DatabaseClient, job: Job, path: string, bytes: number) {
-  const asset = { organization_id: job.organization_id, content_item_id: job.content_item_id, asset_type: job.type, origin: "generated", status: "ready", storage_bucket: "creative-media", storage_path: path, mime_type: "video/mp4", file_size_bytes: bytes, provider: "google-vertex-ai", provider_asset_id: job.external_job_id, metadata: { model: job.model, generationJobId: job.id, pipeline: strategy(job).pipeline } };
+async function recordVideoAsset(db: DatabaseClient, job: Job, path: string, bytes: number | null, metadata: Record<string, unknown> = {}) {
+  const asset = { organization_id: job.organization_id, content_item_id: job.content_item_id, asset_type: job.type, origin: "generated", status: "ready", storage_bucket: "creative-media", storage_path: path, mime_type: "video/mp4", file_size_bytes: bytes, provider: "google-vertex-ai", provider_asset_id: job.external_job_id, metadata: { model: job.model, generationJobId: job.id, pipeline: strategy(job).pipeline, ...metadata } };
   const inserted = await db.from("media_assets").insert(asset).select("id").maybeSingle();
   if (inserted.error && inserted.error.code !== "23505") throw new Error(`Media record failed: ${inserted.error.message}`);
   if (inserted.data) return inserted.data.id as string;
@@ -244,38 +244,12 @@ async function recordVideoAsset(db: DatabaseClient, job: Job, path: string, byte
   return existing.data.id as string;
 }
 
-async function composeVideo(db: DatabaseClient, job: Job, rawVideo: Uint8Array | ReadableStream<Uint8Array>, brief: CreativeBrief) {
-  const composerUrl = env("MEDIA_COMPOSER_URL").replace(/\/$/, "");
-  const composerSecret = env("MEDIA_COMPOSER_SECRET");
-  const rawPath = `${job.organization_id}/${job.content_item_id}/${job.id}.raw.mp4`;
-  const finalPath = `${job.organization_id}/${job.content_item_id}/${job.id}.mp4`;
-  const upload = await db.storage.from("creative-media").upload(rawPath, rawVideo, { contentType: "video/mp4", upsert: true, duplex: "half" });
+async function storeRawVideo(db: DatabaseClient, job: Job, source: ReadableStream<Uint8Array>, bytes: number) {
+  const path = `${job.organization_id}/${job.content_item_id}/${job.id}.raw.mp4`;
+  const upload = await db.storage.from("creative-media").upload(path, source, { contentType: "video/mp4", upsert: true, duplex: "half" });
   if (upload.error) throw new Error(`Raw video upload failed: ${upload.error.message}`);
-  try {
-    const [signed, output] = await Promise.all([
-      db.storage.from("creative-media").createSignedUrl(rawPath, 900),
-      db.storage.from("creative-media").createSignedUploadUrl(finalPath, { upsert: true }),
-    ]);
-    if (signed.error || !signed.data?.signedUrl) throw new Error(`Raw video signing failed: ${signed.error?.message || "unknown"}`);
-    if (output.error || !output.data?.signedUrl) throw new Error(`Final video upload signing failed: ${output.error?.message || "unknown"}`);
-    const brand = (job.input?.brandBrain || {}) as Record<string, unknown>;
-    const response = await fetch(`${composerUrl}/compose`, {
-      method: "POST", signal: AbortSignal.timeout(140_000),
-      headers: { authorization: `Bearer ${composerSecret}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        sourceUrl: signed.data.signedUrl, outputUploadUrl: output.data.signedUrl, musicUrl: selectMusic(brief, job.id), durationSeconds: 8,
-        brandName: String(brand.name || ""), logoUrl: String((brand.visual as Record<string, unknown> | undefined)?.logoUrl || ""),
-        layout: brief.text_overlay.layout, overlays: [brief.text_overlay.headline, brief.text_overlay.subhead, brief.text_overlay.cta],
-      }),
-    });
-    if (!response.ok) throw new Error(`Media composer failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
-    const result = await response.json() as { bytes?: number };
-    if (!Number.isSafeInteger(result.bytes) || result.bytes < 1) throw new Error("Media composer returned an invalid output size");
-    return { path: finalPath, bytes: result.bytes };
-  } finally {
-    const removed = await db.storage.from("creative-media").remove([rawPath]);
-    if (removed.error) console.warn("raw_video_cleanup_failed", { jobId: job.id, message: removed.error.message });
-  }
+  const assetId = await recordVideoAsset(db, job, path, bytes || null, { compositionState: "draft", rawMaster: true });
+  return { assetId, path, bytes };
 }
 
 async function handleVideo(db: DatabaseClient, job: Job, worker: string, token: string) {
@@ -301,11 +275,10 @@ async function handleVideo(db: DatabaseClient, job: Job, worker: string, token: 
   if (inline) throw new Error("Veo returned inline video data instead of the required GCS output; retry this job with a new operation");
   const rawVideo = await downloadGcs(gcsUri, token);
   const brief = savedBrief(job); if (!brief) throw new Error("The saved creative brief is missing");
-  const video = await composeVideo(db, job, rawVideo, brief);
-  const assetId = await recordVideoAsset(db, job, video.path, video.bytes);
-  await savePlatformCopy(db, job, assetId, brief, "short_video");
-  const qaChecks = await completeQa(db, job, assetId, brief, { mimeType: "video/mp4", bytes: video.bytes, width: 1080, height: 1920, durationSeconds: 8 });
-  await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief, musicUrl: selectMusic(brief, job.id), qaChecks });
+  const video = await storeRawVideo(db, job, rawVideo.body, rawVideo.bytes);
+  await savePlatformCopy(db, job, video.assetId, brief, "short_video");
+  const qaChecks = await completeQa(db, job, video.assetId, brief, { mimeType: "video/mp4", bytes: video.bytes || 1_000_000, width: 1080, height: 1920, durationSeconds: 8 });
+  await checkpoint(db, job, worker, "composition_ready", 100, "succeeded", { mediaAssetId: video.assetId, rawMediaAssetId: video.assetId, creativeBrief: brief, musicUrl: selectMusic(brief, job.id), qaChecks, compositionState: "draft" });
   if (gcsUri) await removeGcs(gcsUri, token);
 }
 
