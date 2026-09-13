@@ -54,6 +54,19 @@ function savedBrief(job: Job) {
   return value as CreativeBrief;
 }
 
+const videoTextExclusions = "text, words, letters, numbers, typography, subtitles, subtitle overlay, subtitle track, captions, closed captions, burned-in captions, caption bar, karaoke text, animated text, on-screen writing, text overlay, lower third, speech bubble, transcription, watermark, logo, brand mark, readable signage, labels, packaging text, document text, book text, newspaper text, license plate text, clothing graphics, visible screens, phones, tablets, monitors, app UI, dashboard, interface";
+
+function veoInputs(brief: CreativeBrief) {
+  const prompt = `Create one clean cinematic visual plate from the scene direction below. Treat any references to screens, interfaces, documents, signage, labels, typography, logos, captions, or written copy as visual inspiration only; replace them with unmarked physical objects, abstract light, texture, architecture, or human action. Do not reproduce or invent any writing from the source direction.
+
+SCENE DIRECTION
+${brief.media_prompt}
+
+Execute a single coherent shot with one focal subject, one physically plausible action, few background objects, stable geometry, intentional directional lighting, realistic material detail, restrained commercial color, and uncluttered negative space for overlays added later. Vertical 9:16 framing, 8 seconds, 1080p, photorealistic cinematic video quality, shallow depth of field, stable geometry, tripod-smooth continuous motion, clean unmarked surfaces, silent video with no audio, no text or writing of any kind anywhere in frame.`;
+  const negativePrompt = `${videoTextExclusions}, ${brief.negative_prompt || ""}, jump cuts, scene changes, camera shake, flicker, morphing objects, warped geometry, distorted architecture, extra fingers, distorted hands, harsh flat lighting, oversaturated colors, generic stock-footage aesthetic`;
+  return { prompt, negativePrompt };
+}
+
 async function contentFormat(db: DatabaseClient, job: Job) {
   const supplied = job.input?.contentFormat;
   if (typeof supplied === "string" && ["image", "carousel", "short_video", "text"].includes(supplied)) return supplied;
@@ -258,9 +271,10 @@ async function handleVideo(db: DatabaseClient, job: Job, worker: string, token: 
   const modelPath = `projects/${project}/locations/${location}/publishers/google/models/${model}`;
   if (!job.external_job_id) {
     const brief = savedBrief(job) || await generateCreativeBrief(job, token);
+    const veo = veoInputs(brief);
     const storageUri = env("VEO_OUTPUT_GCS_URI");
     if (!/^gs:\/\/[^/]+\/?$/.test(storageUri)) throw new Error("VEO_OUTPUT_GCS_URI must be a Cloud Storage bucket URI such as gs://bucket-name");
-    const result = await vertex(`${modelPath}:predictLongRunning`, token, { instances: [{ prompt: brief.media_prompt }], parameters: { aspectRatio: "9:16", durationSeconds: 8, sampleCount: 1, resolution: "1080p", generateAudio: false, negativePrompt: brief.negative_prompt, storageUri } });
+    const result = await vertex(`${modelPath}:predictLongRunning`, token, { instances: [{ prompt: veo.prompt }], parameters: { aspectRatio: "9:16", durationSeconds: 8, sampleCount: 1, resolution: "1080p", generateAudio: false, negativePrompt: veo.negativePrompt, storageUri } });
     if (!result.name) throw new Error("Veo returned no operation name");
     await checkpoint(db, job, worker, "provider_processing", 35, "waiting_external", { submittedAt: new Date().toISOString(), creativeBrief: brief }, result.name, 30);
     return;
