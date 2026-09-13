@@ -48,8 +48,10 @@ function strategy(job: Job) {
 }
 
 function savedBrief(job: Job) {
-  const value = job.output?.creativeBrief;
-  return value && typeof value === "object" ? value as CreativeBrief : null;
+  const value = job.output?.creativeBrief || job.input?.creativeBrief;
+  if (!value || typeof value !== "object") return null;
+  if (job.input?.contentFormat === "carousel" && !Array.isArray((value as CreativeBrief).carousel_slides)) return null;
+  return value as CreativeBrief;
 }
 
 async function contentFormat(db: DatabaseClient, job: Job) {
