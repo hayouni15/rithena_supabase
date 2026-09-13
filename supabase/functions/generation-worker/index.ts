@@ -1,6 +1,5 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { creativeBriefPrompt, parseCreativeBrief, type CreativeBrief } from "./creative.ts";
-import { generationMode, imageComposition, imageGenerationPrompt, preservationFor, requestedImageStrategy, type ImageStrategy } from "./image-strategy.ts";
 import { selectMusic } from "./music.ts";
 import { runQualityChecks } from "./quality.ts";
 
@@ -21,7 +20,6 @@ const base64Url = (value: Uint8Array | string) => {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 };
 const decodeBase64 = (value: string) => Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
-const encodeBase64 = (value: Uint8Array) => { let binary = ""; for (const byte of value) binary += String.fromCharCode(byte); return btoa(binary); };
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
 async function accessToken() {
@@ -75,14 +73,14 @@ async function generateCreativeBrief(job: Job, token: string) {
   return parseCreativeBrief(text);
 }
 
-async function savePlatformCopy(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief, format: string, generatedBy = "n8n-parity-v1") {
+async function savePlatformCopy(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief, format: string) {
   const platforms = ((job.input?.strategy as Record<string, unknown> | undefined)?.platforms || []) as string[];
   const video = format === "short_video";
   for (const platform of platforms) {
     const variant = await db.from("platform_variants").upsert({
       organization_id: job.organization_id, content_item_id: job.content_item_id, platform, format,
       status: "ready", aspect_ratio: video ? "9:16" : "4:5", duration_seconds: video ? 8 : null,
-      selected_media_asset_id: assetId, platform_config: { generatedBy },
+      selected_media_asset_id: assetId, platform_config: { generatedBy: "n8n-parity-v1" },
     }, { onConflict: "content_item_id,platform" }).select("id").single();
     if (variant.error) throw new Error(`Platform variant failed: ${variant.error.message}`);
     const hashtags = brief.social_post.hashtags?.[platform] || [];
@@ -109,9 +107,6 @@ async function checkpoint(db: DatabaseClient, job: Job, worker: string, stage: s
 async function storeAsset(db: DatabaseClient, job: Job, bytes: Uint8Array, mimeType: string, providerId?: string, options: { suffix?: string; assetType?: string; metadata?: Record<string, unknown> } = {}) {
   const extension = mimeType === "video/mp4" ? "mp4" : mimeType === "image/jpeg" ? "jpg" : mimeType === "image/webp" ? "webp" : "png";
   const path = `${job.organization_id}/${job.content_item_id}/${job.id}${options.suffix || ""}.${extension}`;
-  const prior = await db.from("media_assets").select("id").eq("organization_id", job.organization_id).eq("content_item_id", job.content_item_id).eq("storage_bucket", "creative-media").eq("storage_path", path).maybeSingle();
-  if (prior.error) throw new Error(`Media record lookup failed: ${prior.error.message}`);
-  if (prior.data) return prior.data.id as string;
   const upload = await db.storage.from("creative-media").upload(path, bytes, { contentType: mimeType, upsert: false });
   if (upload.error && !upload.error.message.toLowerCase().includes("already exists")) throw new Error(`Storage upload failed: ${upload.error.message}`);
   const asset = { organization_id: job.organization_id, content_item_id: job.content_item_id, asset_type: options.assetType || job.type, origin: "generated", status: "ready", storage_bucket: "creative-media", storage_path: path, mime_type: mimeType, file_size_bytes: bytes.byteLength, provider: "google-vertex-ai", provider_asset_id: providerId || null, metadata: { model: job.model, generationJobId: job.id, pipeline: strategy(job).pipeline, ...(options.metadata || {}) } };
@@ -121,82 +116,6 @@ async function storeAsset(db: DatabaseClient, job: Job, bytes: Uint8Array, mimeT
   const existing = await db.from("media_assets").select("id").eq("storage_bucket", "creative-media").eq("storage_path", path).single();
   if (existing.error) throw new Error(`Media record lookup failed: ${existing.error.message}`);
   return existing.data.id as string;
-}
-
-async function loadImageRecipe(db: DatabaseClient, job: Job) {
-  const selected = requestedImageStrategy(job.input || {});
-  const recipe = await db.from("creative_recipes").select("id,key,version,schema_version,manifest").eq("key", selected.recipeId).eq("version", selected.recipeVersion).eq("is_active", true).single();
-  if (recipe.error || !recipe.data) throw new Error(`Selected image recipe is unavailable: ${recipe.error?.message || "unknown"}`);
-  const manifest = recipe.data.manifest as Record<string, unknown>;
-  if (recipe.data.schema_version !== 2 || manifest.schemaVersion !== 2 || manifest.textStrategy !== selected.textStrategy || !Array.isArray(manifest.fieldOwnership)) throw new Error("Selected image recipe does not match its versioned strategy contract");
-  const fieldOwnership = manifest.fieldOwnership as ImageStrategy["fieldOwnership"];
-  const fields = new Set(fieldOwnership.map((field) => field.field));
-  if (fields.size !== 4 || !["headline", "subhead", "cta", "logo"].every((field) => fields.has(field as ImageStrategy["fieldOwnership"][number]["field"])) || fieldOwnership.some((field) => field.precision === "exact" && field.renderer !== "rithena") || fieldOwnership.some((field) => field.field === "logo" && (field.precision !== "exact" || field.renderer !== "rithena"))) throw new Error("Selected image recipe has unsafe field ownership");
-  return { row: recipe.data, selected: { ...selected, fieldOwnership } };
-}
-
-async function previousImageReference(db: DatabaseClient, job: Job, mode: string) {
-  if (mode !== "update_design" || typeof job.input?.sourceMediaAssetId !== "string") return null;
-  let assetId = job.input.sourceMediaAssetId;
-  const selected = await db.from("media_assets").select("storage_bucket,storage_path,mime_type,metadata").eq("id", assetId).eq("organization_id", job.organization_id).eq("content_item_id", job.content_item_id).single();
-  if (selected.error || !selected.data) throw new Error("The previous image version is unavailable");
-  const metadata = selected.data.metadata as Record<string, unknown> | null;
-  if (metadata && typeof metadata.sourceAssetId === "string") assetId = metadata.sourceAssetId;
-  const source = assetId === job.input.sourceMediaAssetId ? selected : await db.from("media_assets").select("storage_bucket,storage_path,mime_type,metadata").eq("id", assetId).eq("organization_id", job.organization_id).eq("content_item_id", job.content_item_id).single();
-  if (source.error || !source.data || !String(source.data.mime_type || "").startsWith("image/")) throw new Error("The previous source artwork is unavailable");
-  const downloaded = await db.storage.from(source.data.storage_bucket).download(source.data.storage_path);
-  if (downloaded.error || !downloaded.data) throw new Error(`Previous artwork download failed: ${downloaded.error?.message || "unknown"}`);
-  const bytes = new Uint8Array(await downloaded.data.arrayBuffer()); if (!bytes.length || bytes.length > 20_000_000) throw new Error("The previous artwork is too large to use as a design reference");
-  return { inlineData: { mimeType: source.data.mime_type, data: encodeBase64(bytes) } };
-}
-
-async function composeImage(db: DatabaseClient, job: Job, sourcePath: string, composition: Record<string, unknown>, suffix = "") {
-  const composerUrl = env("MEDIA_COMPOSER_URL").replace(/\/$/, ""); const composerSecret = env("MEDIA_COMPOSER_SECRET");
-  const finalPath = `${job.organization_id}/${job.content_item_id}/${job.id}${suffix}.composed.png`;
-  const [source, output] = await Promise.all([
-    db.storage.from("creative-media").createSignedUrl(sourcePath, 900),
-    db.storage.from("creative-media").createSignedUploadUrl(finalPath, { upsert: true }),
-  ]);
-  if (source.error || !source.data?.signedUrl) throw new Error(`Source image signing failed: ${source.error?.message || "unknown"}`);
-  if (output.error || !output.data?.signedUrl) throw new Error(`Composed image upload signing failed: ${output.error?.message || "unknown"}`);
-  const brand = (job.input?.brandBrain || {}) as Record<string, unknown>; const visual = (brand.visual || {}) as Record<string, unknown>;
-  const response = await fetch(`${composerUrl}/compose-image`, { method: "POST", signal: AbortSignal.timeout(110_000), headers: { authorization: `Bearer ${composerSecret}`, "content-type": "application/json" }, body: JSON.stringify({ sourceUrl: source.data.signedUrl, outputUploadUrl: output.data.signedUrl, logoUrl: typeof visual.logoUrl === "string" ? visual.logoUrl : "", composition }) });
-  if (!response.ok) throw new Error(`Image composer failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
-  const result = await response.json() as { bytes?: number; checksum?: string; width?: number; height?: number };
-  if (!Number.isSafeInteger(result.bytes) || Number(result.bytes) < 1 || !result.checksum) throw new Error("Image composer returned invalid output metadata");
-  return { path: finalPath, bytes: Number(result.bytes), checksum: String(result.checksum), width: Number(result.width || 1080), height: Number(result.height || 1350) };
-}
-
-async function recordComposedImage(db: DatabaseClient, job: Job, rendered: { path: string; bytes: number; checksum: string; width: number; height: number }, sourceAssetId: string, composition: Record<string, unknown>, brief: CreativeBrief, recipe: Awaited<ReturnType<typeof loadImageRecipe>>, imagePrompt: string, mode: string) {
-  const revision = Number(job.input?.contentRevision); if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("Generation job is missing its content revision");
-  const parentMediaAssetId = typeof job.input?.sourceMediaAssetId === "string" ? job.input.sourceMediaAssetId : null;
-  const briefRow = await db.from("creative_briefs").upsert({ organization_id: job.organization_id, content_item_id: job.content_item_id, objective: strategy(job).title, viewer: String(((job.input?.brandBrain || {}) as Record<string, unknown>).audience || "brand audience"), hook: brief.text_overlay.headline.text, story: strategy(job).concept, emotional_tone: strategy(job).direction, visual_treatment: brief.media_prompt, text_overlay_plan: brief.text_overlay, brand_elements: { sourceAssetId, parentMediaAssetId, recipeId: recipe.selected.recipeId, textStrategy: recipe.selected.textStrategy }, call_to_action: brief.text_overlay.cta.text, audio_direction: brief.audio_cue, platform_constraints: { platforms: (job.input?.strategy as Record<string, unknown> | undefined)?.platforms || [] }, version: revision }, { onConflict: "content_item_id,version" }).select("id").single();
-  if (briefRow.error) throw new Error(`Creative brief persistence failed: ${briefRow.error.message}`);
-  const variants = Array.isArray((recipe.row.manifest as Record<string, unknown>).variants) ? (recipe.row.manifest as Record<string, unknown>).variants as Array<Record<string, unknown>> : [];
-  const projectManifest = { schemaVersion: 2, contentRevision: revision, format: "image", platforms: (job.input?.strategy as Record<string, unknown> | undefined)?.platforms || [], brief: { objective: strategy(job).title, viewer: String(((job.input?.brandBrain || {}) as Record<string, unknown>).audience || "brand audience"), hook: brief.text_overlay.headline.text, story: strategy(job).concept, emotionalTone: strategy(job).direction, callToAction: brief.text_overlay.cta.text }, recipe: { id: recipe.selected.recipeId, version: recipe.selected.recipeVersion, variantId: typeof variants[0]?.id === "string" ? variants[0].id : null }, assetStrategy: { textStrategy: recipe.selected.textStrategy, fieldOwnership: recipe.selected.fieldOwnership, reason: recipe.selected.reason }, generation: { prompt: imagePrompt, provider: "google-vertex-ai", model: job.model, mode, parentMediaAssetId, preserve: preservationFor(mode) }, sourceAssetIds: [sourceAssetId] };
-  const project = await db.from("creative_projects").upsert({ organization_id: job.organization_id, content_item_id: job.content_item_id, creative_brief_id: briefRow.data.id, recipe_id: recipe.row.id, recipe_version: recipe.row.version, status: "composing", schema_version: 2, manifest: projectManifest }, { onConflict: "content_item_id" }).select("id").single();
-  if (project.error) throw new Error(`Creative project persistence failed: ${project.error.message}`);
-  const prior = await db.from("creative_compositions").select("id,revision,content_revision,manifest").eq("creative_project_id", project.data.id).eq("content_revision", revision).order("revision", { ascending: false }).limit(1).maybeSingle();
-  if (prior.error) throw new Error(`Creative composition lookup failed: ${prior.error.message}`);
-  let compositionRow = prior.data;
-  if (!compositionRow) {
-    const latest = await db.from("creative_compositions").select("revision").eq("creative_project_id", project.data.id).order("revision", { ascending: false }).limit(1).maybeSingle();
-    if (latest.error) throw new Error(`Creative composition revision lookup failed: ${latest.error.message}`);
-    const inserted = await db.from("creative_compositions").insert({ organization_id: job.organization_id, creative_project_id: project.data.id, content_item_id: job.content_item_id, revision: Number(latest.data?.revision || 0) + 1, content_revision: revision, schema_version: 1, manifest: composition }).select("id,revision,content_revision,manifest").single();
-    if (inserted.error) throw new Error(`Creative composition persistence failed: ${inserted.error.message}`); compositionRow = inserted.data;
-  }
-  const existingAsset = await db.from("media_assets").select("id").eq("organization_id", job.organization_id).eq("content_item_id", job.content_item_id).eq("storage_bucket", "creative-media").eq("storage_path", rendered.path).maybeSingle();
-  if (existingAsset.error) throw new Error(`Composed media lookup failed: ${existingAsset.error.message}`);
-  const asset = existingAsset.data ? existingAsset : await db.from("media_assets").insert({ organization_id: job.organization_id, content_item_id: job.content_item_id, asset_type: "image", origin: "rendered", status: "ready", storage_bucket: "creative-media", storage_path: rendered.path, mime_type: "image/png", width: rendered.width, height: rendered.height, file_size_bytes: rendered.bytes, checksum: `sha256:${rendered.checksum}`, provider: "rithena-media-composer", metadata: { generationJobId: job.id, sourceAssetId, parentMediaAssetId, compositionId: compositionRow.id, compositionRevision: compositionRow.revision, recipeId: recipe.selected.recipeId, recipeVersion: recipe.selected.recipeVersion, textStrategy: recipe.selected.textStrategy, regenerationMode: mode } }).select("id").single();
-  if (asset.error || !asset.data) throw new Error(`Composed media record failed: ${asset.error?.message || "unknown"}`);
-  const platforms = ((job.input?.strategy as Record<string, unknown> | undefined)?.platforms || []) as string[];
-  for (const platform of platforms) {
-    const renderManifest = { schemaVersion: 1, compositionRevision: compositionRow.revision, contentRevision: revision, platform, format: "image", width: rendered.width, height: rendered.height, mimeType: "image/png", checksum: `sha256:${rendered.checksum}`, recipeId: recipe.selected.recipeId, textStrategy: recipe.selected.textStrategy };
-    const output = await db.from("render_outputs").upsert({ organization_id: job.organization_id, content_item_id: job.content_item_id, creative_project_id: project.data.id, composition_id: compositionRow.id, composition_revision: compositionRow.revision, content_revision: revision, platform, status: "ready", media_asset_id: asset.data.id, generation_job_id: job.id, manifest: renderManifest }, { onConflict: "composition_id,platform" });
-    if (output.error) throw new Error(`Render output persistence failed: ${output.error.message}`);
-  }
-  const ready = await db.from("creative_projects").update({ status: "ready" }).eq("id", project.data.id); if (ready.error) throw new Error(`Creative project completion failed: ${ready.error.message}`);
-  return asset.data.id as string;
 }
 
 async function completeQa(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief, media: { mimeType: string; bytes: number; width?: number | null; height?: number | null; durationSeconds?: number | null }) {
@@ -216,25 +135,16 @@ async function generateImage(db: DatabaseClient, job: Job, worker: string, token
   if (format === "carousel") return generateCarousel(db, job, worker, token);
   const project = env("GOOGLE_CLOUD_PROJECT"); const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
   const model = job.model || Deno.env.get("IMAGE_GEMINI_MODEL") || "gemini-3.1-flash-image";
-  const recipe = await loadImageRecipe(db, job);
-  job.input = { ...job.input, imageStrategy: recipe.selected };
   const brief = savedBrief(job) || await generateCreativeBrief(job, token);
-  const mode = generationMode(job.input); const imagePrompt = imageGenerationPrompt(brief, recipe.selected, mode);
-  const reference = await previousImageReference(db, job, mode); const parts: Record<string, unknown>[] = [{ text: imagePrompt }]; if (reference) parts.push(reference);
-  const providerStartedAt = Date.now();
-  const result = await vertex(`projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`, token, { contents: [{ role: "user", parts }], generationConfig: { responseModalities: ["TEXT", "IMAGE"], imageConfig: { aspectRatio: "4:5" } } });
-  const providerLatencyMs = Date.now() - providerStartedAt;
+  const typography = brief.text_overlay;
+  const imagePrompt = `${brief.media_prompt}\n\nRender only this exact copy with correct spelling: headline “${typography.headline.text}”; supporting line “${typography.subhead.text}”; CTA “${typography.cta.text}”. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
+  const result = await vertex(`projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`, token, { contents: [{ role: "user", parts: [{ text: imagePrompt }] }], generationConfig: { responseModalities: ["TEXT", "IMAGE"], imageConfig: { aspectRatio: "4:5" } } });
   const part = result.candidates?.[0]?.content?.parts?.find((candidate: Record<string, unknown>) => (candidate.inlineData as { mimeType?: string } | undefined)?.mimeType?.startsWith("image/"));
   if (!part?.inlineData?.data) throw new Error("Gemini returned no image data");
-  const bytes = decodeBase64(part.inlineData.data);
-  const parentMediaAssetId = typeof job.input?.sourceMediaAssetId === "string" ? job.input.sourceMediaAssetId : null;
-  const sourceAssetId = await storeAsset(db, job, bytes, part.inlineData.mimeType || "image/png", result.responseId, { suffix: `-source-${recipe.selected.recipeId}`, metadata: { role: "generated_artwork", recipeId: recipe.selected.recipeId, recipeVersion: recipe.selected.recipeVersion, textStrategy: recipe.selected.textStrategy, generationPrompt: imagePrompt, regenerationMode: mode, parentMediaAssetId, preservation: preservationFor(mode), providerLatencyMs, providerUsage: result.usageMetadata || null } });
-  const sourceAsset = await db.from("media_assets").select("storage_path").eq("id", sourceAssetId).single(); if (sourceAsset.error) throw new Error(`Source media lookup failed: ${sourceAsset.error.message}`);
-  const brand = (job.input?.brandBrain || {}) as Record<string, unknown>; const composition = imageComposition(brand, brief, sourceAssetId, recipe.selected); const rendered = await composeImage(db, job, sourceAsset.data.storage_path, composition, `-${recipe.selected.recipeId}`);
-  const assetId = await recordComposedImage(db, job, rendered, sourceAssetId, composition, brief, recipe, imagePrompt, mode);
-  await savePlatformCopy(db, job, assetId, brief, format, `creative-${recipe.selected.textStrategy}-v1`);
-  const qaChecks = await completeQa(db, job, assetId, brief, { mimeType: "image/png", bytes: rendered.bytes, width: rendered.width, height: rendered.height });
-  await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: assetId, sourceMediaAssetId: sourceAssetId, parentMediaAssetId, creativeBrief: brief, recipe: recipe.selected, regenerationMode: mode, providerLatencyMs, composition, qaChecks });
+  const bytes = decodeBase64(part.inlineData.data); const assetId = await storeAsset(db, job, bytes, part.inlineData.mimeType || "image/png", result.responseId);
+  await savePlatformCopy(db, job, assetId, brief, format);
+  const qaChecks = await completeQa(db, job, assetId, brief, { mimeType: part.inlineData.mimeType || "image/png", bytes: bytes.byteLength });
+  await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief, qaChecks });
 }
 
 async function generateCarousel(db: DatabaseClient, job: Job, worker: string, token: string) {
@@ -358,8 +268,8 @@ async function composeVideo(db: DatabaseClient, job: Job, rawVideo: Uint8Array |
     });
     if (!response.ok) throw new Error(`Media composer failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
     const result = await response.json() as { bytes?: number };
-    const bytes = Number(result.bytes); if (!Number.isSafeInteger(bytes) || bytes < 1) throw new Error("Media composer returned an invalid output size");
-    return { path: finalPath, bytes };
+    if (!Number.isSafeInteger(result.bytes) || result.bytes < 1) throw new Error("Media composer returned an invalid output size");
+    return { path: finalPath, bytes: result.bytes };
   } finally {
     const removed = await db.storage.from("creative-media").remove([rawPath]);
     if (removed.error) console.warn("raw_video_cleanup_failed", { jobId: job.id, message: removed.error.message });
