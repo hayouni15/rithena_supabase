@@ -384,7 +384,7 @@ verify_jwt = false
 deno_version = 2
 
 [functions.video-composer]
-verify_jwt = true
+verify_jwt = false
 # The Deno major version to use.
 deno_version = 2
 

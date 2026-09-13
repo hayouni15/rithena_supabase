@@ -5,11 +5,8 @@ const env=(name:string)=>{const value=Deno.env.get(name);if(!value)throw new Err
 
 Deno.serve(async(request)=>{
   if(request.method!=="POST")return json({error:"Method not allowed"},405);
-  const authorization=request.headers.get("authorization")||"";
-  if(!authorization.startsWith("Bearer "))return json({error:"Sign in again to render this video."},401);
-  const serviceKey=env("SUPABASE_SERVICE_ROLE_KEY");const internal=authorization===`Bearer ${serviceKey}`;
-  const userDb=internal?createClient(env("SUPABASE_URL"),serviceKey,{auth:{persistSession:false}}):createClient(env("SUPABASE_URL"),env("SUPABASE_ANON_KEY"),{global:{headers:{authorization}}});
-  if(!internal){const {data:{user}}=await userDb.auth.getUser();if(!user)return json({error:"Sign in again to render this video."},401);}
+  const supplied=request.headers.get("x-rithena-internal-secret")||"";if(!supplied||supplied!==env("VIDEO_COMPOSER_INTERNAL_SECRET"))return json({error:"Unauthorized"},401);
+  const serviceKey=env("SUPABASE_SERVICE_ROLE_KEY");const userDb=createClient(env("SUPABASE_URL"),serviceKey,{auth:{persistSession:false}});
   const body=await request.json() as {contentItemId:string;assetId:string;composition:Record<string,unknown>&{duration:number;overlays:Array<{id:string;text:string}>;audio:{url:string}}};
   const {data:item}=await userDb.from("content_items").select("id,organization_id,status,content_revision").eq("id",body.contentItemId).maybeSingle();if(!item||!["ready_for_review","approved"].includes(item.status))return json({error:"This video is not ready for composition."},409);
   const {data:raw}=await userDb.from("media_assets").select("id,storage_bucket,storage_path,metadata").eq("id",body.assetId).eq("content_item_id",item.id).eq("organization_id",item.organization_id).maybeSingle();if(!raw||(raw.metadata as Record<string,unknown>)?.rawMaster!==true)return json({error:"The raw video master is unavailable."},404);
