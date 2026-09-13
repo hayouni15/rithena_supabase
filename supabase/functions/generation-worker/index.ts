@@ -73,14 +73,14 @@ async function generateCreativeBrief(job: Job, token: string) {
   return parseCreativeBrief(text);
 }
 
-async function savePlatformCopy(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief, format: string) {
+async function savePlatformCopy(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief, format: string, generatedBy = "n8n-parity-v1") {
   const platforms = ((job.input?.strategy as Record<string, unknown> | undefined)?.platforms || []) as string[];
   const video = format === "short_video";
   for (const platform of platforms) {
     const variant = await db.from("platform_variants").upsert({
       organization_id: job.organization_id, content_item_id: job.content_item_id, platform, format,
       status: "ready", aspect_ratio: video ? "9:16" : "4:5", duration_seconds: video ? 8 : null,
-      selected_media_asset_id: assetId, platform_config: { generatedBy: "n8n-parity-v1" },
+      selected_media_asset_id: assetId, platform_config: { generatedBy },
     }, { onConflict: "content_item_id,platform" }).select("id").single();
     if (variant.error) throw new Error(`Platform variant failed: ${variant.error.message}`);
     const hashtags = brief.social_post.hashtags?.[platform] || [];
@@ -107,6 +107,9 @@ async function checkpoint(db: DatabaseClient, job: Job, worker: string, stage: s
 async function storeAsset(db: DatabaseClient, job: Job, bytes: Uint8Array, mimeType: string, providerId?: string, options: { suffix?: string; assetType?: string; metadata?: Record<string, unknown> } = {}) {
   const extension = mimeType === "video/mp4" ? "mp4" : mimeType === "image/jpeg" ? "jpg" : mimeType === "image/webp" ? "webp" : "png";
   const path = `${job.organization_id}/${job.content_item_id}/${job.id}${options.suffix || ""}.${extension}`;
+  const prior = await db.from("media_assets").select("id").eq("organization_id", job.organization_id).eq("content_item_id", job.content_item_id).eq("storage_bucket", "creative-media").eq("storage_path", path).maybeSingle();
+  if (prior.error) throw new Error(`Media record lookup failed: ${prior.error.message}`);
+  if (prior.data) return prior.data.id as string;
   const upload = await db.storage.from("creative-media").upload(path, bytes, { contentType: mimeType, upsert: false });
   if (upload.error && !upload.error.message.toLowerCase().includes("already exists")) throw new Error(`Storage upload failed: ${upload.error.message}`);
   const asset = { organization_id: job.organization_id, content_item_id: job.content_item_id, asset_type: options.assetType || job.type, origin: "generated", status: "ready", storage_bucket: "creative-media", storage_path: path, mime_type: mimeType, file_size_bytes: bytes.byteLength, provider: "google-vertex-ai", provider_asset_id: providerId || null, metadata: { model: job.model, generationJobId: job.id, pipeline: strategy(job).pipeline, ...(options.metadata || {}) } };
@@ -116,6 +119,70 @@ async function storeAsset(db: DatabaseClient, job: Job, bytes: Uint8Array, mimeT
   const existing = await db.from("media_assets").select("id").eq("storage_bucket", "creative-media").eq("storage_path", path).single();
   if (existing.error) throw new Error(`Media record lookup failed: ${existing.error.message}`);
   return existing.data.id as string;
+}
+
+function imageComposition(job: Job, brief: CreativeBrief, sourceAssetId: string, options: { headline?: string; subhead?: string; includeCta?: boolean } = {}) {
+  const layout = brief.text_overlay.layout; const left = layout === "left_stacked";
+  const headline = options.headline ?? brief.text_overlay.headline.text; const subhead = options.subhead ?? brief.text_overlay.subhead.text;
+  const layers: Record<string, unknown>[] = [
+    { id: "plate", kind: "source_image", name: "Visual plate", visible: true, order: 1, bounds: { x: 0, y: 0, width: 1, height: 1 }, assetId: sourceAssetId, focalPoint: { x: left ? 0.68 : 0.5, y: 0.5 }, fit: "cover" },
+    { id: "contrast", kind: "treatment", name: "Text contrast", visible: true, order: 2, bounds: left ? { x: 0, y: 0, width: 0.62, height: 1 } : { x: 0, y: 0.55, width: 1, height: 0.45 }, treatment: layout === "centered_serif" ? "scrim" : "gradient", styleToken: "brand.contrast" },
+    { id: "title", kind: "text", name: "Title", visible: true, order: 3, bounds: left ? { x: 0.08, y: 0.2, width: 0.48, height: 0.25 } : { x: 0.08, y: 0.58, width: 0.84, height: 0.16 }, role: "title", text: headline, styleToken: layout === "centered_serif" ? "type.display-serif" : "type.display-bold", alignment: left ? "left" : "center" },
+    { id: "subtitle", kind: "text", name: "Subtitle", visible: Boolean(subhead), order: 4, bounds: left ? { x: 0.08, y: 0.49, width: 0.48, height: 0.12 } : { x: 0.12, y: 0.74, width: 0.76, height: 0.08 }, role: "subtitle", text: subhead || " ", styleToken: "type.body", alignment: left ? "left" : "center" },
+  ];
+  if (options.includeCta !== false) layers.push({ id: "cta", kind: "text", name: "Call to action", visible: true, order: 5, bounds: left ? { x: 0.08, y: 0.78, width: 0.48, height: 0.07 } : { x: 0.12, y: 0.84, width: 0.76, height: 0.06 }, role: "cta", text: brief.text_overlay.cta.text, styleToken: "type.cta", alignment: left ? "left" : "center" });
+  const brand = (job.input?.brandBrain || {}) as Record<string, unknown>; const visual = (brand.visual || {}) as Record<string, unknown>;
+  if (typeof visual.logoUrl === "string" && visual.logoUrl.startsWith("https://")) layers.push({ id: "logo", kind: "logo", name: "Brand logo", visible: true, order: 6, bounds: { x: 0.08, y: 0.07, width: 0.16, height: 0.08 }, assetId: "brand-logo", placement: "top_left" });
+  return { schemaVersion: 1, format: "image", canvas: { width: 1080, height: 1350, aspectRatio: "4:5" }, safeZones: [{ id: "content-safe", purpose: "content", x: 0.06, y: 0.06, width: 0.88, height: 0.84 }, { id: "platform-ui", purpose: "platform_ui", x: 0, y: 0.92, width: 1, height: 0.08 }], layers, brandStyleId: `${String(brand.name || "brand").toLowerCase().replace(/[^a-z0-9]+/g, "-") || "brand"}-v1` };
+}
+
+async function composeImage(db: DatabaseClient, job: Job, sourcePath: string, composition: Record<string, unknown>, suffix = "") {
+  const composerUrl = env("MEDIA_COMPOSER_URL").replace(/\/$/, ""); const composerSecret = env("MEDIA_COMPOSER_SECRET");
+  const finalPath = `${job.organization_id}/${job.content_item_id}/${job.id}${suffix}.composed.png`;
+  const [source, output] = await Promise.all([
+    db.storage.from("creative-media").createSignedUrl(sourcePath, 900),
+    db.storage.from("creative-media").createSignedUploadUrl(finalPath, { upsert: true }),
+  ]);
+  if (source.error || !source.data?.signedUrl) throw new Error(`Source image signing failed: ${source.error?.message || "unknown"}`);
+  if (output.error || !output.data?.signedUrl) throw new Error(`Composed image upload signing failed: ${output.error?.message || "unknown"}`);
+  const brand = (job.input?.brandBrain || {}) as Record<string, unknown>; const visual = (brand.visual || {}) as Record<string, unknown>;
+  const response = await fetch(`${composerUrl}/compose-image`, { method: "POST", signal: AbortSignal.timeout(110_000), headers: { authorization: `Bearer ${composerSecret}`, "content-type": "application/json" }, body: JSON.stringify({ sourceUrl: source.data.signedUrl, outputUploadUrl: output.data.signedUrl, logoUrl: typeof visual.logoUrl === "string" ? visual.logoUrl : "", composition }) });
+  if (!response.ok) throw new Error(`Image composer failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
+  const result = await response.json() as { bytes?: number; checksum?: string; width?: number; height?: number };
+  if (!Number.isSafeInteger(result.bytes) || Number(result.bytes) < 1 || !result.checksum) throw new Error("Image composer returned invalid output metadata");
+  return { path: finalPath, bytes: Number(result.bytes), checksum: String(result.checksum), width: Number(result.width || 1080), height: Number(result.height || 1350) };
+}
+
+async function recordComposedImage(db: DatabaseClient, job: Job, rendered: { path: string; bytes: number; checksum: string; width: number; height: number }, sourceAssetId: string, composition: Record<string, unknown>, brief: CreativeBrief) {
+  const revision = Number(job.input?.contentRevision); if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("Generation job is missing its content revision");
+  const recipe = await db.from("creative_recipes").select("id,version").eq("key", "foundation-image").eq("version", 1).single();
+  if (recipe.error || !recipe.data) throw new Error(`Foundation image recipe is unavailable: ${recipe.error?.message || "unknown"}`);
+  const briefRow = await db.from("creative_briefs").upsert({ organization_id: job.organization_id, content_item_id: job.content_item_id, objective: strategy(job).title, viewer: String(((job.input?.brandBrain || {}) as Record<string, unknown>).audience || "brand audience"), hook: brief.text_overlay.headline.text, story: strategy(job).concept, emotional_tone: strategy(job).direction, visual_treatment: brief.media_prompt, text_overlay_plan: brief.text_overlay, brand_elements: { sourceAssetId }, call_to_action: brief.text_overlay.cta.text, audio_direction: brief.audio_cue, platform_constraints: { platforms: (job.input?.strategy as Record<string, unknown> | undefined)?.platforms || [] }, version: revision }, { onConflict: "content_item_id,version" }).select("id").single();
+  if (briefRow.error) throw new Error(`Creative brief persistence failed: ${briefRow.error.message}`);
+  const projectManifest = { schemaVersion: 1, contentRevision: revision, format: "image", platforms: (job.input?.strategy as Record<string, unknown> | undefined)?.platforms || [], brief: { objective: strategy(job).title, viewer: String(((job.input?.brandBrain || {}) as Record<string, unknown>).audience || "brand audience"), hook: brief.text_overlay.headline.text, story: strategy(job).concept, emotionalTone: strategy(job).direction, callToAction: brief.text_overlay.cta.text }, recipe: { id: "foundation-image", version: 1, variantId: brief.text_overlay.layout }, sourceAssetIds: [sourceAssetId] };
+  const project = await db.from("creative_projects").upsert({ organization_id: job.organization_id, content_item_id: job.content_item_id, creative_brief_id: briefRow.data.id, recipe_id: recipe.data.id, recipe_version: recipe.data.version, status: "composing", schema_version: 1, manifest: projectManifest }, { onConflict: "content_item_id" }).select("id").single();
+  if (project.error) throw new Error(`Creative project persistence failed: ${project.error.message}`);
+  const prior = await db.from("creative_compositions").select("id,revision,content_revision,manifest").eq("creative_project_id", project.data.id).eq("content_revision", revision).order("revision", { ascending: false }).limit(1).maybeSingle();
+  if (prior.error) throw new Error(`Creative composition lookup failed: ${prior.error.message}`);
+  let compositionRow = prior.data;
+  if (!compositionRow) {
+    const latest = await db.from("creative_compositions").select("revision").eq("creative_project_id", project.data.id).order("revision", { ascending: false }).limit(1).maybeSingle();
+    if (latest.error) throw new Error(`Creative composition revision lookup failed: ${latest.error.message}`);
+    const inserted = await db.from("creative_compositions").insert({ organization_id: job.organization_id, creative_project_id: project.data.id, content_item_id: job.content_item_id, revision: Number(latest.data?.revision || 0) + 1, content_revision: revision, schema_version: 1, manifest: composition }).select("id,revision,content_revision,manifest").single();
+    if (inserted.error) throw new Error(`Creative composition persistence failed: ${inserted.error.message}`); compositionRow = inserted.data;
+  }
+  const existingAsset = await db.from("media_assets").select("id").eq("organization_id", job.organization_id).eq("content_item_id", job.content_item_id).eq("storage_bucket", "creative-media").eq("storage_path", rendered.path).maybeSingle();
+  if (existingAsset.error) throw new Error(`Composed media lookup failed: ${existingAsset.error.message}`);
+  const asset = existingAsset.data ? existingAsset : await db.from("media_assets").insert({ organization_id: job.organization_id, content_item_id: job.content_item_id, asset_type: "image", origin: "rendered", status: "ready", storage_bucket: "creative-media", storage_path: rendered.path, mime_type: "image/png", width: rendered.width, height: rendered.height, file_size_bytes: rendered.bytes, checksum: `sha256:${rendered.checksum}`, provider: "rithena-media-composer", metadata: { generationJobId: job.id, sourceAssetId, compositionId: compositionRow.id, compositionRevision: compositionRow.revision } }).select("id").single();
+  if (asset.error || !asset.data) throw new Error(`Composed media record failed: ${asset.error?.message || "unknown"}`);
+  const platforms = ((job.input?.strategy as Record<string, unknown> | undefined)?.platforms || []) as string[];
+  for (const platform of platforms) {
+    const renderManifest = { schemaVersion: 1, compositionRevision: compositionRow.revision, contentRevision: revision, platform, format: "image", width: rendered.width, height: rendered.height, mimeType: "image/png", checksum: `sha256:${rendered.checksum}` };
+    const output = await db.from("render_outputs").upsert({ organization_id: job.organization_id, content_item_id: job.content_item_id, creative_project_id: project.data.id, composition_id: compositionRow.id, composition_revision: compositionRow.revision, content_revision: revision, platform, status: "ready", media_asset_id: asset.data.id, generation_job_id: job.id, manifest: renderManifest }, { onConflict: "composition_id,platform" });
+    if (output.error) throw new Error(`Render output persistence failed: ${output.error.message}`);
+  }
+  const ready = await db.from("creative_projects").update({ status: "ready" }).eq("id", project.data.id); if (ready.error) throw new Error(`Creative project completion failed: ${ready.error.message}`);
+  return asset.data.id as string;
 }
 
 async function completeQa(db: DatabaseClient, job: Job, assetId: string, brief: CreativeBrief, media: { mimeType: string; bytes: number; width?: number | null; height?: number | null; durationSeconds?: number | null }) {
@@ -136,15 +203,18 @@ async function generateImage(db: DatabaseClient, job: Job, worker: string, token
   const project = env("GOOGLE_CLOUD_PROJECT"); const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
   const model = job.model || Deno.env.get("IMAGE_GEMINI_MODEL") || "gemini-3.1-flash-image";
   const brief = savedBrief(job) || await generateCreativeBrief(job, token);
-  const typography = brief.text_overlay;
-  const imagePrompt = `${brief.media_prompt}\n\nRender only this exact copy with correct spelling: headline “${typography.headline.text}”; supporting line “${typography.subhead.text}”; CTA “${typography.cta.text}”. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
+  const imagePrompt = `${brief.media_prompt}\n\nGenerate a clean visual plate only. Leave intentional low-detail negative space for editorial overlays. Do not render text, letters, numbers, logos, watermarks, signs, screens, interface elements, captions, or CTA graphics anywhere in the image. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
   const result = await vertex(`projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`, token, { contents: [{ role: "user", parts: [{ text: imagePrompt }] }], generationConfig: { responseModalities: ["TEXT", "IMAGE"], imageConfig: { aspectRatio: "4:5" } } });
   const part = result.candidates?.[0]?.content?.parts?.find((candidate: Record<string, unknown>) => (candidate.inlineData as { mimeType?: string } | undefined)?.mimeType?.startsWith("image/"));
   if (!part?.inlineData?.data) throw new Error("Gemini returned no image data");
-  const bytes = decodeBase64(part.inlineData.data); const assetId = await storeAsset(db, job, bytes, part.inlineData.mimeType || "image/png", result.responseId);
-  await savePlatformCopy(db, job, assetId, brief, format);
-  const qaChecks = await completeQa(db, job, assetId, brief, { mimeType: part.inlineData.mimeType || "image/png", bytes: bytes.byteLength });
-  await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: assetId, creativeBrief: brief, qaChecks });
+  const bytes = decodeBase64(part.inlineData.data);
+  const sourceAssetId = await storeAsset(db, job, bytes, part.inlineData.mimeType || "image/png", result.responseId, { suffix: "-source", metadata: { role: "source_plate" } });
+  const sourceAsset = await db.from("media_assets").select("storage_path").eq("id", sourceAssetId).single(); if (sourceAsset.error) throw new Error(`Source media lookup failed: ${sourceAsset.error.message}`);
+  const composition = imageComposition(job, brief, sourceAssetId); const rendered = await composeImage(db, job, sourceAsset.data.storage_path, composition);
+  const assetId = await recordComposedImage(db, job, rendered, sourceAssetId, composition, brief);
+  await savePlatformCopy(db, job, assetId, brief, format, "structured-composition-v1");
+  const qaChecks = await completeQa(db, job, assetId, brief, { mimeType: "image/png", bytes: rendered.bytes, width: rendered.width, height: rendered.height });
+  await checkpoint(db, job, worker, "qa_complete", 100, "succeeded", { mediaAssetId: assetId, sourceMediaAssetId: sourceAssetId, creativeBrief: brief, composition, qaChecks });
 }
 
 async function generateCarousel(db: DatabaseClient, job: Job, worker: string, token: string) {

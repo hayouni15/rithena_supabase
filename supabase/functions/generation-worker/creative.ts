@@ -60,9 +60,9 @@ ${job.type === "video" ? `VIDEO DIRECTION
 - Use the whole 4:5 canvas with mobile-safe margins. Keep all text at least 8% from every edge.
 ` : `IMAGE DIRECTION
 - Use the whole 4:5 canvas as one seamless composition with deliberate negative space and mobile-safe margins.
-- Render the exact headline, subhead, and CTA from text_overlay as clean, correctly spelled, high-contrast editorial typography integrated into the scene. Do not render any other words.
-- Keep all text at least 8% from every edge. Headline belongs in the upper third, hero visual in the center, CTA in the lower safe area.
-- Use a credible premium type style consistent with the supplied Brand Brain. No pill-shaped CTA buttons.
+- Generate imagery only and deliberately reserve a low-detail area for Rithena's deterministic text composition.
+- The media_prompt must prohibit all text, letters, numbers, logos, watermarks, signs, screens, interface elements, captions, and CTA graphics.
+- Keep the principal subject clear of the reserved overlay area and mobile-safe margins.
 `}
 TEXT OVERLAY
 - A sound-off viewer must understand the message. Headline: 3-6 words. Subhead: at most 14 words. CTA: at most 5 words. Total at most 25 words.
