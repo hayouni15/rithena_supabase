@@ -381,6 +381,10 @@ inspector_port = 8083
 
 [functions.generation-worker]
 verify_jwt = false
+deno_version = 2
+
+[functions.video-composer]
+verify_jwt = true
 # The Deno major version to use.
 deno_version = 2
 
