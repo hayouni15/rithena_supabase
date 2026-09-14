@@ -125,11 +125,21 @@ function strategy(job: Job) {
 function savedBrief(job: Job) {
   const value = job.output?.creativeBrief || job.input?.creativeBrief;
   if (!value || typeof value !== "object") return null;
-  if (
-    job.input?.contentFormat === "carousel" &&
-    !Array.isArray((value as CreativeBrief).carousel_slides)
-  )
-    return null;
+  if (job.input?.contentFormat === "carousel") {
+    const slides = (value as CreativeBrief).carousel_slides;
+    if (
+      !Array.isArray(slides) ||
+      slides.length !== 4 ||
+      slides.some((slide) =>
+        !slide ||
+        typeof slide.headline !== "string" ||
+        !slide.headline.trim() ||
+        typeof slide.body !== "string" ||
+        typeof slide.media_prompt !== "string" ||
+        !slide.media_prompt.trim()
+      )
+    ) return null;
+  }
   return value as CreativeBrief;
 }
 
@@ -176,6 +186,18 @@ async function contentFormat(db: DatabaseClient, job: Job) {
   return String(result.data.format);
 }
 
+function timedTextSchema() {
+  return {
+    type: "OBJECT",
+    required: ["text", "in_time", "out_time"],
+    properties: {
+      text: { type: "STRING" },
+      in_time: { type: "NUMBER" },
+      out_time: { type: "NUMBER" },
+    },
+  };
+}
+
 async function generateCreativeBrief(job: Job, token: string) {
   const project = env("GOOGLE_CLOUD_PROJECT");
   const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
@@ -202,6 +224,60 @@ async function generateCreativeBrief(job: Job, token: string) {
       ],
       generationConfig: {
         responseMimeType: "application/json",
+        responseSchema: {
+          type: "OBJECT",
+          required: ["media_prompt", "negative_prompt", "text_overlay", "audio_cue", "carousel_slides", "social_post"],
+          properties: {
+            media_prompt: { type: "STRING" },
+            negative_prompt: { type: "STRING" },
+            text_overlay: {
+              type: "OBJECT",
+              required: ["layout", "headline", "subhead", "cta"],
+              properties: {
+                layout: { type: "STRING", enum: ["bottom_minimal", "centered_serif", "left_stacked"] },
+                headline: timedTextSchema(),
+                subhead: timedTextSchema(),
+                cta: timedTextSchema(),
+              },
+            },
+            audio_cue: { type: "STRING" },
+            carousel_slides: {
+              type: "ARRAY",
+              minItems: job.input?.contentFormat === "carousel" ? 4 : 0,
+              maxItems: job.input?.contentFormat === "carousel" ? 4 : 0,
+              items: {
+                type: "OBJECT",
+                required: ["headline", "body", "media_prompt"],
+                properties: {
+                  headline: { type: "STRING" },
+                  body: { type: "STRING" },
+                  media_prompt: { type: "STRING" },
+                },
+              },
+            },
+            social_post: {
+              type: "OBJECT",
+              required: ["caption", "hashtags", "titles"],
+              properties: {
+                caption: { type: "STRING" },
+                hashtags: {
+                  type: "OBJECT",
+                  properties: Object.fromEntries(
+                    ["instagram", "facebook", "linkedin", "tiktok", "youtube"].map((platform) => [
+                      platform,
+                      { type: "ARRAY", items: { type: "STRING" } },
+                    ]),
+                  ),
+                },
+                titles: {
+                  type: "OBJECT",
+                  required: ["youtube", "tiktok"],
+                  properties: { youtube: { type: "STRING" }, tiktok: { type: "STRING" } },
+                },
+              },
+            },
+          },
+        },
         temperature: 0.85,
         maxOutputTokens: 8192,
       },
@@ -481,7 +557,20 @@ async function generateCarousel(
   const location = Deno.env.get("GOOGLE_CLOUD_LOCATION") || "global";
   const model =
     job.model || Deno.env.get("IMAGE_GEMINI_MODEL") || "gemini-3.1-flash-image";
-  const brief = savedBrief(job) || (await generateCreativeBrief(job, token));
+  let brief = savedBrief(job);
+  if (!brief) {
+    brief = await generateCreativeBrief(job, token);
+    const slides = brief.carousel_slides;
+    if (
+      !Array.isArray(slides) ||
+      slides.length !== 4 ||
+      slides.some((slide) => !slide.headline?.trim() || !slide.media_prompt?.trim())
+    ) throw new Error("Creative director returned an incomplete four-slide carousel");
+    await checkpoint(db, job, worker, "carousel_brief_complete", 10, "running", {
+      creativeBrief: brief,
+    });
+    job.output = { ...job.output, creativeBrief: brief };
+  }
   const slides = brief.carousel_slides;
   if (
     !Array.isArray(slides) ||
