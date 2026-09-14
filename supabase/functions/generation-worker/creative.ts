@@ -33,6 +33,7 @@ export function creativeBriefPrompt(job: BriefJob) {
     bannedTreatments: visual.bannedTreatments || [],
   };
   const regenerationDirection = typeof input.regenerationDirection === "string" ? input.regenerationDirection.trim() : "";
+  const regenerationKind = input.regenerationKind === "modify" ? "modify" : "new";
   const contentFormat = String((input as Record<string, unknown>).contentFormat || "");
   const carousel = contentFormat === "carousel";
   const medium = job.type === "video" ? "one continuous 8-second vertical 9:16 video" : carousel ? "a coherent four-slide 1080x1350 social carousel" : "one 1080x1350 4:5 portrait image";
@@ -53,7 +54,7 @@ ${JSON.stringify(styleContract, null, 2)}
 - These are requirements, not optional inspiration. Do not replace them with generic stock photography, a generic SaaS aesthetic, or an unrelated cinematic treatment.
 
 ${regenerationDirection ? `REGENERATION DIRECTION
-This is a fresh rendition of the same planned idea. Follow this human direction while preserving verified brand facts, the planned CTA, and platform constraints:
+${regenerationKind === "modify" ? "The current creative will be supplied to the image model as a visual reference. Apply only the requested changes and preserve its recognizable subject, composition, camera angle, and visual identity wherever the direction does not require a change." : "Create a fresh rendition of the same planned idea without copying the previous composition."} Follow this human direction while preserving verified brand facts, the planned CTA, and platform constraints:
 ${regenerationDirection}
 ` : ""}
 

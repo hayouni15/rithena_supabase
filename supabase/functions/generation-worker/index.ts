@@ -44,6 +44,11 @@ const base64Url = (value: Uint8Array | string) => {
 };
 const decodeBase64 = (value: string) =>
   Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+const encodeBase64 = (value: Uint8Array) => {
+  let binary = "";
+  for (const byte of value) binary += String.fromCharCode(byte);
+  return btoa(binary);
+};
 const json = (value: unknown, status = 200) =>
   new Response(JSON.stringify(value), {
     status,
@@ -462,6 +467,36 @@ async function storeAsset(
   return existing.data.id as string;
 }
 
+async function sourceImagePart(
+  db: DatabaseClient,
+  job: Job,
+  slideIndex?: number,
+) {
+  if (job.input?.regenerationKind !== "modify") return null;
+  const query = db
+    .from("media_assets")
+    .select("storage_bucket,storage_path,mime_type,metadata,created_at")
+    .eq("organization_id", job.organization_id)
+    .eq("content_item_id", job.content_item_id)
+    .eq("status", "ready")
+    .eq("asset_type", slideIndex ? "carousel_slide" : "image")
+    .order("created_at", { ascending: false })
+    .limit(slideIndex ? 50 : 1);
+  const source = await query;
+  if (source.error) throw new Error(`Source image lookup failed: ${source.error.message}`);
+  const asset = slideIndex
+    ? (source.data || []).find((entry: Record<string, unknown>) => {
+        const metadata = entry.metadata && typeof entry.metadata === "object" ? entry.metadata as Record<string, unknown> : {};
+        return Number(metadata.slideIndex) === slideIndex && metadata.generationJobId !== job.id;
+      })
+    : source.data?.[0];
+  if (!asset) throw new Error(slideIndex ? `Current carousel slide ${slideIndex} is unavailable for modification` : "The current image is unavailable for modification");
+  const downloaded = await db.storage.from(asset.storage_bucket).download(asset.storage_path);
+  if (downloaded.error || !downloaded.data) throw new Error(`Source image download failed: ${downloaded.error?.message || "empty asset"}`);
+  const bytes = new Uint8Array(await downloaded.data.arrayBuffer());
+  return { inlineData: { data: encodeBase64(bytes), mimeType: asset.mime_type || downloaded.data.type || "image/png" } };
+}
+
 async function completeQa(
   db: DatabaseClient,
   job: Job,
@@ -508,12 +543,14 @@ async function generateImage(
     job.model || Deno.env.get("IMAGE_GEMINI_MODEL") || "gemini-3.1-flash-image";
   const brief = savedBrief(job) || (await generateCreativeBrief(job, token));
   const typography = brief.text_overlay;
-  const imagePrompt = `${brief.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections visibly through palette, lighting, composition, texture, environment, and typography. Banned treatments are prohibited.\n\nRender only this exact copy with correct spelling: headline “${typography.headline.text}”; supporting line “${typography.subhead.text}”; CTA “${typography.cta.text}”. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
+  const sourcePart = await sourceImagePart(db, job);
+  const editInstruction = sourcePart ? `The first input is the current creative. Edit that image according to this direction: “${String(job.input.regenerationDirection || "")}”. Preserve everything that the direction does not explicitly require changing, including the recognizable subject, composition, camera angle, spatial relationships, and brand character. Return one revised image, not an analysis or a visually unrelated replacement.\n\n` : "";
+  const imagePrompt = `${editInstruction}${brief.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections visibly through palette, lighting, composition, texture, environment, and typography. Banned treatments are prohibited.\n\nRender only this exact copy with correct spelling: headline “${typography.headline.text}”; supporting line “${typography.subhead.text}”; CTA “${typography.cta.text}”. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
   const result = await vertex(
     `projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`,
     token,
     {
-      contents: [{ role: "user", parts: [{ text: imagePrompt }] }],
+      contents: [{ role: "user", parts: [...(sourcePart ? [sourcePart] : []), { text: imagePrompt }] }],
       generationConfig: {
         responseModalities: ["TEXT", "IMAGE"],
         imageConfig: { aspectRatio: "4:5" },
@@ -614,12 +651,14 @@ async function generateCarousel(
     }
   }
   if (!assetId) {
-    const prompt = `${slide.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections consistently across the series; banned treatments are prohibited.\n\nThis is slide ${index + 1} of 4 in one coherent carousel. Render only this exact copy with correct spelling: headline “${slide.headline}”; supporting line “${slide.body || ""}”. Maintain consistent brand palette, subject, lighting, typography, and visual language across the series. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
+    const sourcePart = await sourceImagePart(db, job, index + 1);
+    const editInstruction = sourcePart ? `The first input is the current version of carousel slide ${index + 1}. Edit that image according to this direction: “${String(job.input.regenerationDirection || "")}”. Preserve everything the direction does not explicitly require changing and return a revised slide rather than an unrelated replacement.\n\n` : "";
+    const prompt = `${editInstruction}${slide.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections consistently across the series; banned treatments are prohibited.\n\nThis is slide ${index + 1} of 4 in one coherent carousel. Render only this exact copy with correct spelling: headline “${slide.headline}”; supporting line “${slide.body || ""}”. Maintain consistent brand palette, subject, lighting, typography, and visual language across the series. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
     const result = await vertex(
       `projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`,
       token,
       {
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        contents: [{ role: "user", parts: [...(sourcePart ? [sourcePart] : []), { text: prompt }] }],
         generationConfig: {
           responseModalities: ["TEXT", "IMAGE"],
           imageConfig: { aspectRatio: "4:5" },
