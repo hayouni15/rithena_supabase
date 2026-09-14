@@ -22,6 +22,16 @@ export function creativeBriefPrompt(job: BriefJob) {
   const input = job.input || {};
   const strategy = input.strategy || {};
   const brandBrain = input.brandBrain || {};
+  const brain = brandBrain as Record<string, unknown>;
+  const visual = brain.visual && typeof brain.visual === "object" ? brain.visual as Record<string, unknown> : {};
+  const styleContract = {
+    creativePersonalities: brain.personalities || [],
+    colors: visual.colors || [],
+    typographyClues: visual.typographyClues || [],
+    photographyStyle: visual.photographyStyle || [],
+    visualKeywords: visual.visualKeywords || [],
+    bannedTreatments: visual.bannedTreatments || [],
+  };
   const regenerationDirection = typeof input.regenerationDirection === "string" ? input.regenerationDirection.trim() : "";
   const contentFormat = String((input as Record<string, unknown>).contentFormat || "");
   const carousel = contentFormat === "carousel";
@@ -33,6 +43,14 @@ ${JSON.stringify(brandBrain, null, 2)}
 
 PLANNED CONTENT:
 ${JSON.stringify(strategy, null, 2)}
+
+MANDATORY VISUAL STYLE CONTRACT:
+${JSON.stringify(styleContract, null, 2)}
+- Translate every selected creative personality, photography style, visual keyword, and palette color into concrete decisions in media_prompt.
+- State where the selected colors appear and express the personalities through composition, lighting, camera behavior, texture, styling, and pace.
+- Use typography clues for the separate deterministic overlay plan; for video, never ask Veo to draw that typography.
+- Every banned treatment is a hard exclusion and must also appear in negative_prompt.
+- These are requirements, not optional inspiration. Do not replace them with generic stock photography, a generic SaaS aesthetic, or an unrelated cinematic treatment.
 
 ${regenerationDirection ? `REGENERATION DIRECTION
 This is a fresh rendition of the same planned idea. Follow this human direction while preserving verified brand facts, the planned CTA, and platform constraints:
