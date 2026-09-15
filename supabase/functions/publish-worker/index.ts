@@ -2,7 +2,7 @@ import { createClient } from "npm:@supabase/supabase-js@2";
 
 type Json = Record<string, unknown>;
 type Job = { id:string; organization_id:string; content_item_id:string; platform_variant_id:string; social_connection_id:string; content_revision:number; state:string; provider_job_id:string|null; provider_payload:Json; attempt:number; max_attempts:number };
-type Credential = { ciphertext:string; organizationId:string; brandId:string; connectionId:string; accountId:string; platform:"instagram"|"facebook" };
+type Credential = { ciphertext:string; organizationId:string; brandId:string; connectionId:string; accountId:string; platform:"instagram"|"facebook"|"linkedin" };
 // deno-lint-ignore no-explicit-any
 type Db = any;
 
@@ -16,8 +16,9 @@ class PublishError extends Error {
 }
 
 async function decrypt(envelope:string,credential:Credential){
+  const platformName=credential.platform[0].toUpperCase()+credential.platform.slice(1);
   const [version,iv,tag,ciphertext,extra]=envelope.split(".");
-  if(version!=="v1"||!iv||!tag||!ciphertext||extra!==undefined) throw new PublishError("credential_invalid",`${credential.platform === "facebook" ? "Facebook" : "Instagram"} credentials could not be read. Reconnect the account.`,false);
+  if(version!=="v1"||!iv||!tag||!ciphertext||extra!==undefined) throw new PublishError("credential_invalid",`${platformName} credentials could not be read. Reconnect the account.`,false);
   const keyBytes=fromBase64(env("SOCIAL_CREDENTIALS_ENCRYPTION_KEY"));
   if(keyBytes.length!==32) throw new Error("SOCIAL_CREDENTIALS_ENCRYPTION_KEY must decode to 32 bytes");
   const key=await crypto.subtle.importKey("raw",keyBytes,"AES-GCM",false,["decrypt"]);
@@ -25,7 +26,7 @@ async function decrypt(envelope:string,credential:Credential){
   const combined=new Uint8Array(encrypted.length+authTag.length); combined.set(encrypted); combined.set(authTag,encrypted.length);
   const aad=new TextEncoder().encode(JSON.stringify(["rithena:social-credentials:v1",credential.organizationId,credential.brandId,credential.connectionId]));
   try { return new TextDecoder().decode(await crypto.subtle.decrypt({name:"AES-GCM",iv:fromBase64Url(iv),additionalData:aad,tagLength:128},key,combined)); }
-  catch { throw new PublishError("credential_invalid",`${credential.platform === "facebook" ? "Facebook" : "Instagram"} credentials could not be read. Reconnect the account.`,false); }
+  catch { throw new PublishError("credential_invalid",`${platformName} credentials could not be read. Reconnect the account.`,false); }
 }
 
 function graphVersion(){ const version=env("INSTAGRAM_API_VERSION"); if(!/^v\d+\.0$/.test(version)) throw new Error("INSTAGRAM_API_VERSION must look like v24.0"); return version; }
@@ -58,24 +59,24 @@ async function createContainer(accountId:string,token:string,parameters:Record<s
 }
 
 async function resources(db:Db,job:Job){
-  const variant=await db.from("platform_variants").select("format,selected_media_asset_id,post_copies(caption,hashtags,is_selected,version)").eq("id",job.platform_variant_id).eq("organization_id",job.organization_id).single();
-  if(variant.error||!variant.data) throw new PublishError("content_unavailable","The approved Instagram version is no longer available.",false);
+  const variant=await db.from("platform_variants").select("format,selected_media_asset_id,post_copies(title,headline,subhead,caption,hashtags,is_selected,version)").eq("id",job.platform_variant_id).eq("organization_id",job.organization_id).single();
+  if(variant.error||!variant.data) throw new PublishError("content_unavailable","The approved social version is no longer available.",false);
   const selected=[...(variant.data.post_copies||[])].sort((a:{is_selected:boolean;version:number},b:{is_selected:boolean;version:number})=>Number(b.is_selected)-Number(a.is_selected)||b.version-a.version)[0];
-  if(!selected?.is_selected) throw new PublishError("copy_unavailable","The selected Instagram caption is no longer available.",false);
+  if(!selected?.is_selected) throw new PublishError("copy_unavailable","The selected social caption is no longer available.",false);
   const selectedAsset=await db.from("media_assets").select("id,metadata").eq("id",variant.data.selected_media_asset_id).eq("organization_id",job.organization_id).single();
-  if(selectedAsset.error||!selectedAsset.data) throw new PublishError("media_unavailable","The approved Instagram media is no longer available.",false);
-  let query=db.from("media_assets").select("id,asset_type,storage_bucket,storage_path,mime_type,metadata").eq("organization_id",job.organization_id).eq("content_item_id",job.content_item_id).eq("status","ready");
+  if(selectedAsset.error||!selectedAsset.data) throw new PublishError("media_unavailable","The approved social media is no longer available.",false);
+  let query=db.from("media_assets").select("id,asset_type,storage_bucket,storage_path,mime_type,file_size_bytes,metadata").eq("organization_id",job.organization_id).eq("content_item_id",job.content_item_id).eq("status","ready");
   if(variant.data.format!=="carousel") query=query.eq("id",variant.data.selected_media_asset_id);
   else {
     const generationJobId=selectedAsset.data.metadata?.generationJobId;
     query=query.eq("asset_type","carousel_slide");
     if(typeof generationJobId==="string"&&generationJobId) query=query.contains("metadata",{generationJobId});
   }
-  const assets=await query; if(assets.error||!assets.data?.length) throw new PublishError("media_unavailable","The approved Instagram media is no longer available.",false);
+  const assets=await query; if(assets.error||!assets.data?.length) throw new PublishError("media_unavailable","The approved social media is no longer available.",false);
   const ordered=[...assets.data].sort((a:{metadata:Json},b:{metadata:Json})=>Number(a.metadata?.slideIndex||0)-Number(b.metadata?.slideIndex||0));
   if(variant.data.format==="carousel"&&(ordered.length<2||ordered.length>10)) throw new PublishError("carousel_invalid","Instagram carousels require between 2 and 10 ready slides.",false);
   const caption=[selected.caption||"",...(selected.hashtags||[])].filter(Boolean).join("\n\n");
-  return {format:variant.data.format as string,assets:ordered,caption};
+  return {format:variant.data.format as string,assets:ordered,caption,title:String(selected.title||selected.headline||selected.subhead||"").slice(0,200)};
 }
 
 async function signedUrl(db:Db,asset:{storage_bucket:string;storage_path:string}){
@@ -108,6 +109,36 @@ async function runFacebook(db:Db,job:Job,worker:string,credential:Credential,tok
   if(!payload.publishRequestedAt){await checkpoint(db,job,worker,"waiting_external",{payload:{stage:"publishing",photoIds,publishRequestedAt:new Date().toISOString()},retryAfter:1});return;}
   const body=new URLSearchParams({message:source.caption});photoIds.forEach((id,index)=>body.set(`attached_media[${index}]`,JSON.stringify({media_fbid:id})));
   const result=await facebookGraph(`${credential.accountId}/feed`,token,{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body},true);const id=typeof result.id==="string"?result.id:"";if(!id)throw new PublishError("publish_outcome_unknown","Facebook accepted the post but did not return its ID. Check the Page before retrying.",false);let permalink:string|undefined;try{const post=await facebookGraph(`${id}?fields=permalink_url`,token);if(typeof post.permalink_url==="string")permalink=post.permalink_url;}catch{/* publish succeeded */}await checkpoint(db,job,worker,"succeeded",{payload:{stage:"published",remotePostId:id,photoIds},remoteId:id,remoteUrl:permalink});
+}
+
+function linkedinVersion(){const version=env("LINKEDIN_VERSION");if(!/^20\d{4}$/.test(version))throw new Error("LINKEDIN_VERSION must look like 202603");return version;}
+function linkedinToken(decrypted:string){try{const stored=JSON.parse(decrypted) as {accessToken?:string;expiresAt?:string};if(!stored.accessToken)throw new Error();if(stored.expiresAt&&Date.parse(stored.expiresAt)<=Date.now())throw new PublishError("linkedin_expired","LinkedIn access expired. Reconnect the Company Page, then reschedule.",false);return stored.accessToken;}catch(error){if(error instanceof PublishError)throw error;throw new PublishError("credential_invalid","LinkedIn credentials could not be read. Reconnect LinkedIn.",false);}}
+async function linkedin(path:string,token:string,init:RequestInit={},ambiguous=false):Promise<{body:Json;response:Response}>{
+  let response:Response;
+  try{response=await fetch(`https://api.linkedin.com/rest/${path}`,{...init,headers:{authorization:`Bearer ${token}`,"Linkedin-Version":linkedinVersion(),"X-Restli-Protocol-Version":"2.0.0",...init.headers},signal:AbortSignal.timeout(45_000)});}
+  catch{throw new PublishError(ambiguous?"publish_outcome_unknown":"linkedin_unavailable",ambiguous?"LinkedIn received the publish request, but its result could not be confirmed. Check the Company Page before retrying.":"LinkedIn could not be reached. Rithena will retry automatically.",!ambiguous);}
+  let body:Json={};try{body=await response.json() as Json;}catch{/* upload and empty responses are valid */}
+  if(!response.ok){const message=String(body.message||body.errorDetails||"LinkedIn rejected this post.").slice(0,400);if(response.status===401)throw new PublishError("linkedin_revoked","LinkedIn access was removed or expired. Reconnect the Company Page, then reschedule.",false);if(response.status===403)throw new PublishError("linkedin_permissions","LinkedIn no longer allows publishing for this Company Page. Reconnect it and grant publishing access.",false);if(response.status===429||response.status>=500)throw new PublishError("linkedin_unavailable","LinkedIn is temporarily unavailable. Rithena will retry automatically.",true);throw new PublishError(`linkedin_${response.status}`,message,false);}
+  return {body,response};
+}
+async function assetBytes(db:Db,asset:{storage_bucket:string;storage_path:string}){const result=await db.storage.from(asset.storage_bucket).download(asset.storage_path);if(result.error||!result.data)throw new PublishError("media_delivery_failed","The approved media could not be prepared for LinkedIn.",true);return new Uint8Array(await result.data.arrayBuffer());}
+async function uploadLinkedInImage(db:Db,asset:{storage_bucket:string;storage_path:string;mime_type:string},owner:string,token:string){
+  const initialized=await linkedin("images?action=initializeUpload",token,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({initializeUploadRequest:{owner}})});const value=initialized.body.value as Json|undefined;const uploadUrl=String(value?.uploadUrl||"");const image=String(value?.image||"");if(!uploadUrl||!image)throw new PublishError("linkedin_invalid_response","LinkedIn did not initialize the image upload.",true);
+  const bytes=await assetBytes(db,asset);const response=await fetch(uploadUrl,{method:"PUT",headers:{authorization:`Bearer ${token}`,"content-type":asset.mime_type||"application/octet-stream"},body:bytes,signal:AbortSignal.timeout(90_000)});if(!response.ok)throw new PublishError(response.status>=500?"linkedin_unavailable":"linkedin_upload_failed","LinkedIn could not upload the image.",response.status>=500);return image;
+}
+async function uploadLinkedInVideo(db:Db,asset:{storage_bucket:string;storage_path:string;mime_type:string},owner:string,token:string){
+  const bytes=await assetBytes(db,asset);const initialized=await linkedin("videos?action=initializeUpload",token,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({initializeUploadRequest:{owner,fileSizeBytes:bytes.byteLength,uploadCaptions:false,uploadThumbnail:false}})});const value=initialized.body.value as Json|undefined;const video=String(value?.video||"");const instructions=Array.isArray(value?.uploadInstructions)?value.uploadInstructions as Json[]:[];if(!video||!instructions.length)throw new PublishError("linkedin_invalid_response","LinkedIn did not initialize the video upload.",true);
+  const uploadedPartIds:string[]=[];for(const instruction of instructions){const first=Number(instruction.firstByte||0),last=Number(instruction.lastByte);const uploadUrl=String(instruction.uploadUrl||"");if(!uploadUrl||!Number.isFinite(last))throw new PublishError("linkedin_invalid_response","LinkedIn returned invalid video upload instructions.",true);const response=await fetch(uploadUrl,{method:"PUT",headers:{authorization:`Bearer ${token}`,"content-type":asset.mime_type||"application/octet-stream"},body:bytes.slice(first,last+1),signal:AbortSignal.timeout(120_000)});if(!response.ok)throw new PublishError(response.status>=500?"linkedin_unavailable":"linkedin_upload_failed","LinkedIn could not upload the video.",response.status>=500);const etag=response.headers.get("etag");if(!etag)throw new PublishError("linkedin_invalid_response","LinkedIn did not confirm an uploaded video part.",true);uploadedPartIds.push(etag.replace(/^\"|\"$/g,""));}
+  await linkedin("videos?action=finalizeUpload",token,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({finalizeUploadRequest:{video,uploadToken:"",uploadedPartIds}})});return video;
+}
+async function linkedinMediaReady(urn:string,token:string){const kind=urn.includes(":video:")?"videos":"images";const result=await linkedin(`${kind}/${encodeURIComponent(urn)}`,token);const status=String((result.body.value as Json|undefined)?.status||result.body.status||"").toUpperCase();if(["PROCESSING_FAILED","CLIENT_ERROR","SERVER_ERROR"].includes(status))throw new PublishError("linkedin_processing_failed","LinkedIn could not process the uploaded media.",false);return status==="AVAILABLE";}
+async function runLinkedIn(db:Db,job:Job,worker:string,credential:Credential,token:string){
+  const source=await resources(db,job);const payload=job.provider_payload||{};const owner=`urn:li:organization:${credential.accountId}`;const mediaUrns=Array.isArray(payload.mediaUrns)?payload.mediaUrns.filter((id):id is string=>typeof id==="string"):[];
+  if(mediaUrns.length<source.assets.length){const asset=source.assets[mediaUrns.length];const isVideo=String(asset.mime_type||"").startsWith("video/");const urn=isVideo?await uploadLinkedInVideo(db,asset,owner,token):await uploadLinkedInImage(db,asset,owner,token);await checkpoint(db,job,worker,"waiting_external",{payload:{stage:"processing_media",mediaUrns:[...mediaUrns,urn],processingPolls:0},retryAfter:isVideo?15:3});return;}
+  const ready=await Promise.all(mediaUrns.map((urn)=>linkedinMediaReady(urn,token)));if(ready.some((value)=>!value)){const polls=Number(payload.processingPolls||0)+1;if(polls>40)throw new PublishError("linkedin_processing_timeout","LinkedIn did not finish processing this media within the expected time.",false);await checkpoint(db,job,worker,"waiting_external",{payload:{stage:"processing_media",mediaUrns,processingPolls:polls},retryAfter:15});return;}
+  if(!payload.publishRequestedAt){await checkpoint(db,job,worker,"waiting_external",{payload:{stage:"publishing",mediaUrns,publishRequestedAt:new Date().toISOString()},retryAfter:1});return;}
+  const content=mediaUrns.length>1?{multiImage:{images:mediaUrns.map((id)=>({id,altText:source.title||"Post image"}))}}:{media:{id:mediaUrns[0],title:source.title||undefined}};
+  const result=await linkedin("posts",token,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({author:owner,commentary:source.caption.slice(0,3000),visibility:"PUBLIC",distribution:{feedDistribution:"MAIN_FEED",targetEntities:[],thirdPartyDistributionChannels:[]},content,lifecycleState:"PUBLISHED",isReshareDisabledByAuthor:false})},true);const remoteId=result.response.headers.get("x-restli-id")||String(result.body.id||"");if(!remoteId)throw new PublishError("publish_outcome_unknown","LinkedIn accepted the post but did not return its ID. Check the Company Page before retrying.",false);await checkpoint(db,job,worker,"succeeded",{payload:{stage:"published",mediaUrns,remotePostId:remoteId},remoteId,remoteUrl:`https://www.linkedin.com/feed/update/${remoteId}/`});
 }
 
 async function run(db:Db,job:Job,worker:string,credential:Credential,token:string){
@@ -162,6 +193,7 @@ Deno.serve(async(request)=>{
     if(secret.error) throw new PublishError("credential_invalid","The social account must be reconnected before this post can publish.",false);
     const credential=secret.data as Credential; const decrypted=await decrypt(credential.ciphertext,credential);
     if(credential.platform==="facebook")await runFacebook(db,job,worker,credential,facebookToken(decrypted,credential.accountId));
+    else if(credential.platform==="linkedin")await runLinkedIn(db,job,worker,credential,linkedinToken(decrypted));
     else if(job.provider_payload?.stage==="publishing"&&job.provider_payload?.publishRequestedAt) await publishPrepared(db,job,worker,credential,decrypted);
     else await run(db,job,worker,credential,decrypted);
     return json({ok:true,claimed:true,jobId:job.id});
