@@ -73,7 +73,7 @@ export function runQualityChecks(job: QualityJob, brief: CreativeBrief, media: {
   if (subheadWords > 14) copyIssues.push(issue("subhead_length", "The subhead exceeds 14 words.", "Shorten the subhead to 14 words or fewer.", { field: "subhead", quote: brief.text_overlay.subhead.text, suggestion: "Shorten this subhead to 14 words or fewer while preserving the verified benefit." }));
   if (ctaWords < 1 || ctaWords > 5) copyIssues.push(issue("cta_length", "The CTA is outside the 1–5 word reading budget.", "Use a specific CTA of 1–5 words.", { field: "cta", quote: brief.text_overlay.cta.text, suggestion: "Replace this with a specific 1–5 word action and destination." }));
   if (brief.social_post.caption.trim().split(/(?<=[.!?])\s+/).filter(Boolean).length > 5) copyIssues.push(issue("caption_length", "The caption exceeds five sentences.", "Reduce the caption to 3–5 short sentences.", { field: "caption", quote: brief.social_post.caption, suggestion: "Condense this caption to 3–5 short sentences without losing verified facts or the CTA." }));
-  const expectedHashtags: Record<string, number> = { instagram: 10, tiktok: 10, youtube: 10, linkedin: 5 };
+  const expectedHashtags: Record<string, number> = { instagram: 10, tiktok: 10, youtube: 10, facebook: 5, linkedin: 5 };
   const platforms = Array.isArray(strategy.platforms) ? strategy.platforms.map(String) : [];
   for (const platform of platforms) {
     const expected = expectedHashtags[platform];

@@ -95,10 +95,15 @@ TEXT OVERLAY
 
 SOCIAL COPY
 - Write like a thoughtful human operator. Be concrete, conversational, confident, and restrained.
-- Caption: 3-5 short sentences. Open with the audience's real problem or desire, connect it to the supported benefit, mention the brand naturally, and close with the CTA.
-- Return platform-specific hashtags: exactly 10 each for Instagram, TikTok, and YouTube; exactly 5 for LinkedIn. Do not duplicate the same set across platforms.
+- Caption: 3-5 short sentences. Open with the audience's real problem or desire, connect it to the supported benefit, include the exact brand name ${JSON.stringify(String(brain.name || "the supplied brand"))} naturally in the caption itself, and close with the CTA. Never replace the brand name with "we", "our", "the brand", or an unnamed product.
+- Return all five platform-specific hashtag arrays. Instagram, TikTok, and YouTube must each contain exactly 10 distinct hashtags. Facebook and LinkedIn must each contain exactly 5 distinct hashtags. Every entry must be one complete hashtag beginning with #, with no spaces inside it. Count each array immediately before returning JSON and do not reuse an identical set across platforms.
 - YouTube title: useful and searchable, at most 60 characters. TikTok title: conversational, at most 80 characters.
 - Audio cue format: Mood: [descriptor] — Genre: [instrumental genre] — Tempo: [BPM range], no lyrics.
+
+FINAL COPY CHECK
+- Reject your own draft and correct it before responding unless the caption contains the exact supplied brand name.
+- Count the hashtag entries, not the words: instagram=10, tiktok=10, youtube=10, facebook=5, linkedin=5.
+- Return only after every count is exact and every hashtag is distinct within its platform array.
 
 Return only valid JSON with this exact shape:
 {

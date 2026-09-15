@@ -210,19 +210,22 @@ async function generateCreativeBrief(job: Job, token: string) {
     Deno.env.get("CREATIVE_GEMINI_MODEL") ||
     Deno.env.get("STRATEGY_GEMINI_MODEL") ||
     "gemini-2.5-flash";
-  const result = await vertex(
-    `projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`,
-    token,
-    {
+  const basePrompt = creativeBriefPrompt({
+    type: job.type === "video" ? "video" : "image",
+    input: job.input,
+  });
+  let correction = "";
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await vertex(
+      `projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`,
+      token,
+      {
       contents: [
         {
           role: "user",
           parts: [
             {
-              text: creativeBriefPrompt({
-                type: job.type === "video" ? "video" : "image",
-                input: job.input,
-              }),
+              text: `${basePrompt}${correction}`,
             },
           ],
         },
@@ -267,10 +270,11 @@ async function generateCreativeBrief(job: Job, token: string) {
                 caption: { type: "STRING" },
                 hashtags: {
                   type: "OBJECT",
+                  required: ["instagram", "facebook", "linkedin", "tiktok", "youtube"],
                   properties: Object.fromEntries(
                     ["instagram", "facebook", "linkedin", "tiktok", "youtube"].map((platform) => [
                       platform,
-                      { type: "ARRAY", items: { type: "STRING" } },
+                      { type: "ARRAY", minItems: ["facebook", "linkedin"].includes(platform) ? 5 : 10, maxItems: ["facebook", "linkedin"].includes(platform) ? 5 : 10, items: { type: "STRING" } },
                     ]),
                   ),
                 },
@@ -286,12 +290,30 @@ async function generateCreativeBrief(job: Job, token: string) {
         temperature: 0.85,
         maxOutputTokens: 8192,
       },
-    },
-  );
-  const text = (result.candidates?.[0]?.content?.parts || [])
-    .map((part: { text?: string }) => part.text || "")
-    .join("");
-  return parseCreativeBrief(text);
+      },
+    );
+    const text = (result.candidates?.[0]?.content?.parts || [])
+      .map((part: { text?: string }) => part.text || "")
+      .join("");
+    const brief = parseCreativeBrief(text);
+    const brain = (job.input?.brandBrain || {}) as Record<string, unknown>;
+    const strategy = (job.input?.strategy || {}) as Record<string, unknown>;
+    const brandName = String(brain.name || "").trim();
+    const platforms = Array.isArray(strategy.platforms) ? strategy.platforms.map(String) : [];
+    const expectedHashtags: Record<string, number> = { instagram: 10, tiktok: 10, youtube: 10, facebook: 5, linkedin: 5 };
+    const failures: string[] = [];
+    if (brandName && !brief.social_post.caption.toLocaleLowerCase().includes(brandName.toLocaleLowerCase())) failures.push(`caption must contain the exact brand name ${JSON.stringify(brandName)}`);
+    for (const platform of platforms) {
+      const hashtags = brief.social_post.hashtags?.[platform] || [];
+      const expected = expectedHashtags[platform];
+      if (expected && hashtags.length !== expected) failures.push(`${platform} must contain exactly ${expected} hashtags, received ${hashtags.length}`);
+      if (new Set(hashtags.map((tag) => tag.toLocaleLowerCase())).size !== hashtags.length) failures.push(`${platform} hashtags must be distinct`);
+      if (hashtags.some((tag) => !/^#[^\s#]+$/.test(tag))) failures.push(`${platform} contains an invalid hashtag entry`);
+    }
+    if (!failures.length) return brief;
+    correction = `\n\nCORRECTION REQUIRED AFTER A FAILED DRAFT\nThe previous response failed these mandatory checks:\n- ${failures.join("\n- ")}\nGenerate the complete JSON brief again. Preserve the strategy and verified facts, but correct every listed copy failure before responding.`;
+  }
+  throw new Error("Creative director could not satisfy the required brand and platform copy rules");
 }
 
 async function savePlatformCopy(
