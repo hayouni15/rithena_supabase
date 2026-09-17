@@ -86,6 +86,7 @@ ${job.type === "video" ? `VIDEO DIRECTION
 - Render the exact headline, subhead, and CTA from text_overlay as clean, correctly spelled, high-contrast editorial typography integrated into the scene. Do not render any other words.
 - Keep all text at least 8% from every edge. Headline belongs in the upper third, hero visual in the center, CTA in the lower safe area.
 - Use a credible premium type style consistent with the supplied Brand Brain. No pill-shaped CTA buttons.
+- This is a finished image, not a text-free plate. negative_prompt must never prohibit text, words, letters, writing, typography, headlines, subheads, CTAs, captions, labels, logos, or brand marks because those prohibitions suppress the required overlay copy.
 `}
 TEXT OVERLAY
 - A sound-off viewer must understand the message. Headline: 3-6 words. Subhead: at most 14 words. CTA: at most 5 words. Total at most 25 words.

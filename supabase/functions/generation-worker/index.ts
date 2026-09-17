@@ -157,6 +157,15 @@ function mediaStyleContract(job: Job) {
   return JSON.stringify({ creativePersonalities: brain.personalities || [], colors: visual.colors || [], typographyClues: visual.typographyClues || [], photographyStyle: visual.photographyStyle || [], visualKeywords: visual.visualKeywords || [], bannedTreatments: visual.bannedTreatments || [] });
 }
 
+function imageNegativePrompt(value: string | undefined) {
+  return String(value || "")
+    .split(/[,;\n]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .filter((entry) => !/\b(?:text|typography|letters?|words?|writing|handwriting|numbers?|captions?|subtitles?|headlines?|subheads?|cta|call[- ]to[- ]action|labels?|logos?|brand marks?)\b/i.test(entry))
+    .join(", ");
+}
+
 function veoInputs(brief: CreativeBrief, job: Job) {
   const prompt = `Create one clean cinematic visual plate from the scene direction below. Treat any references to screens, interfaces, documents, signage, labels, typography, logos, captions, or written copy as visual inspiration only; replace them with unmarked physical objects, abstract light, texture, architecture, or human action. Do not reproduce or invent any writing from the source direction.
 
@@ -565,9 +574,10 @@ async function generateImage(
     job.model || Deno.env.get("IMAGE_GEMINI_MODEL") || "gemini-3.1-flash-image";
   const brief = savedBrief(job) || (await generateCreativeBrief(job, token));
   const typography = brief.text_overlay;
+  const visualExclusions = imageNegativePrompt(brief.negative_prompt);
   const sourcePart = await sourceImagePart(db, job);
   const editInstruction = sourcePart ? `The first input is the current creative. Edit that image according to this direction: “${String(job.input.regenerationDirection || "")}”. Preserve everything that the direction does not explicitly require changing, including the recognizable subject, composition, camera angle, spatial relationships, and brand character. Return one revised image, not an analysis or a visually unrelated replacement.\n\n` : "";
-  const imagePrompt = `${editInstruction}${brief.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections visibly through palette, lighting, composition, texture, environment, and typography. Banned treatments are prohibited.\n\nRender only this exact copy with correct spelling: headline “${typography.headline.text}”; supporting line “${typography.subhead.text}”; CTA “${typography.cta.text}”. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
+  const imagePrompt = `${editInstruction}${brief.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections visibly through palette, lighting, composition, texture, environment, and typography. Banned treatments are prohibited.\n\nMANDATORY IMAGE TYPOGRAPHY: This is a finished social image, not a clean visual plate. The final image must visibly include all three text elements as legible, high-contrast editorial typography with correct spelling. Headline: “${typography.headline.text}”. Supporting line: “${typography.subhead.text}”. CTA: “${typography.cta.text}”. Place the headline in the upper safe area, supporting line beneath it, and CTA in the lower safe area. Do not omit, paraphrase, or replace any of these three elements. Render no other words. Any earlier instruction that requests no text, typography, letters, words, captions, labels, or writing does not apply to these three mandatory overlays.${visualExclusions ? `\n\nVisual exclusions: ${visualExclusions}` : ""}`;
   const result = await vertex(
     `projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`,
     token,
@@ -675,7 +685,8 @@ async function generateCarousel(
   if (!assetId) {
     const sourcePart = await sourceImagePart(db, job, index + 1);
     const editInstruction = sourcePart ? `The first input is the current version of carousel slide ${index + 1}. Edit that image according to this direction: “${String(job.input.regenerationDirection || "")}”. Preserve everything the direction does not explicitly require changing and return a revised slide rather than an unrelated replacement.\n\n` : "";
-    const prompt = `${editInstruction}${slide.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections consistently across the series; banned treatments are prohibited.\n\nThis is slide ${index + 1} of 4 in one coherent carousel. Render only this exact copy with correct spelling: headline “${slide.headline}”; supporting line “${slide.body || ""}”. Maintain consistent brand palette, subject, lighting, typography, and visual language across the series. ${brief.negative_prompt ? `Avoid: ${brief.negative_prompt}` : ""}`;
+    const visualExclusions = imageNegativePrompt(brief.negative_prompt);
+    const prompt = `${editInstruction}${slide.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections consistently across the series; banned treatments are prohibited.\n\nMANDATORY CAROUSEL TYPOGRAPHY: This is a finished carousel slide, not a clean visual plate. The final slide must visibly include the exact headline “${slide.headline}” and supporting line “${slide.body || ""}” as legible, high-contrast editorial typography with correct spelling. Do not omit, paraphrase, or replace this copy, and render no other words. Any earlier instruction that requests no text, typography, letters, words, captions, labels, or writing does not apply to these mandatory overlays. Maintain consistent brand palette, subject, lighting, typography, and visual language across the series.${visualExclusions ? `\n\nVisual exclusions: ${visualExclusions}` : ""}`;
     const result = await vertex(
       `projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`,
       token,
