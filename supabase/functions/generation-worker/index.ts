@@ -1096,7 +1096,7 @@ Deno.serve(async (request) => {
     env("SUPABASE_SERVICE_ROLE_KEY"),
     { auth: { persistSession: false } },
   );
-  const claimed = await db.rpc("claim_next_generation_job", {
+  const claimed = await db.rpc("claim_next_standard_generation_job", {
     p_worker_id: worker,
     p_lease_seconds: 300,
   });
