@@ -1,6 +1,7 @@
 export type CreativeBrief = {
   media_prompt: string;
   negative_prompt: string;
+  include_logo?: boolean;
   text_overlay: {
     layout: "bottom_minimal" | "centered_serif" | "left_stacked";
     headline: { text: string; in_time: number; out_time: number };

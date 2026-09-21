@@ -130,6 +130,12 @@ function strategy(job: Job) {
 function savedBrief(job: Job) {
   const value = job.output?.creativeBrief || job.input?.creativeBrief;
   if (!value || typeof value !== "object") return null;
+  const brain = (job.input?.brandBrain || {}) as Record<string, unknown>;
+  const brandName = String(brain.name || "").trim().toLocaleLowerCase();
+  const caption = String((value as CreativeBrief).social_post?.caption || "").toLocaleLowerCase();
+  // Older strategy briefs did not require branded captions. Regenerate those
+  // instead of carrying them into QA where they can only fail brand accuracy.
+  if (brandName && !caption.includes(brandName)) return null;
   if (job.input?.contentFormat === "carousel") {
     const slides = (value as CreativeBrief).carousel_slides;
     if (
@@ -528,6 +534,30 @@ async function sourceImagePart(
   return { inlineData: { data: encodeBase64(bytes), mimeType: asset.mime_type || downloaded.data.type || "image/png" } };
 }
 
+async function logoImagePart(job: Job, brief: CreativeBrief) {
+  if (brief.include_logo === false) return null;
+  const brain = (job.input?.brandBrain || {}) as Record<string, unknown>;
+  const visual = brain.visual && typeof brain.visual === "object" ? brain.visual as Record<string, unknown> : {};
+  const logoUrl = typeof visual.logoUrl === "string" ? visual.logoUrl.trim() : "";
+  if (!logoUrl) return null;
+  let url: URL;
+  try { url = new URL(logoUrl); } catch { return null; }
+  if (url.protocol !== "https:") return null;
+  const response = await fetch(url, { signal: AbortSignal.timeout(15_000), redirect: "follow" });
+  if (!response.ok) throw new Error(`Brand logo download failed (${response.status})`);
+  const mimeType = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  if (!mimeType.startsWith("image/")) throw new Error("The Brand Brain logo URL did not return an image");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (!bytes.byteLength || bytes.byteLength > 5_000_000) throw new Error("The Brand Brain logo must be smaller than 5 MB");
+  return { inlineData: { data: encodeBase64(bytes), mimeType } };
+}
+
+function logoReferencePrompt(hasLogo: boolean) {
+  return hasLogo
+    ? "The supplied BRAND LOGO REFERENCE is identity source material, not loose inspiration. Reproduce that exact logo faithfully, preserving its lettering, symbol, proportions, colors, and spacing. Integrate it organically into the composition as a natural brand signature, product mark, tasteful corner lockup, or context-appropriate physical detail. Keep it clearly legible without making it oversized, floating, repetitive, or disconnected from the design."
+    : "";
+}
+
 async function completeQa(
   db: DatabaseClient,
   job: Job,
@@ -576,13 +606,14 @@ async function generateImage(
   const typography = brief.text_overlay;
   const visualExclusions = imageNegativePrompt(brief.negative_prompt);
   const sourcePart = await sourceImagePart(db, job);
+  const logoPart = await logoImagePart(job, brief);
   const editInstruction = sourcePart ? `The first input is the current creative. Edit that image according to this direction: “${String(job.input.regenerationDirection || "")}”. Preserve everything that the direction does not explicitly require changing, including the recognizable subject, composition, camera angle, spatial relationships, and brand character. Return one revised image, not an analysis or a visually unrelated replacement.\n\n` : "";
-  const imagePrompt = `${editInstruction}${brief.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections visibly through palette, lighting, composition, texture, environment, and typography. Banned treatments are prohibited.\n\nMANDATORY IMAGE TYPOGRAPHY: This is a finished social image, not a clean visual plate. The final image must visibly include all three text elements as legible, high-contrast editorial typography with correct spelling. Headline: “${typography.headline.text}”. Supporting line: “${typography.subhead.text}”. CTA: “${typography.cta.text}”. Place the headline in the upper safe area, supporting line beneath it, and CTA in the lower safe area. Do not omit, paraphrase, or replace any of these three elements. Render no other words. Any earlier instruction that requests no text, typography, letters, words, captions, labels, or writing does not apply to these three mandatory overlays.${visualExclusions ? `\n\nVisual exclusions: ${visualExclusions}` : ""}`;
+  const imagePrompt = `${editInstruction}${brief.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections visibly through palette, lighting, composition, texture, environment, and typography. Banned treatments are prohibited.${logoPart ? `\n\n${logoReferencePrompt(true)}` : ""}\n\nMANDATORY IMAGE TYPOGRAPHY: This is a finished social image, not a clean visual plate. The final image must visibly include all three text elements as legible, high-contrast editorial typography with correct spelling. Headline: “${typography.headline.text}”. Supporting line: “${typography.subhead.text}”. CTA: “${typography.cta.text}”. Place the headline in the upper safe area, supporting line beneath it, and CTA in the lower safe area. Do not omit, paraphrase, or replace any of these three elements. Render no other words besides the supplied brand logo. Any earlier instruction that requests no text, typography, letters, words, captions, labels, logos, brand marks, or writing does not apply to these mandatory overlays or the supplied logo.${visualExclusions ? `\n\nVisual exclusions: ${visualExclusions}` : ""}`;
   const result = await vertex(
     `projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`,
     token,
     {
-      contents: [{ role: "user", parts: [...(sourcePart ? [sourcePart] : []), { text: imagePrompt }] }],
+      contents: [{ role: "user", parts: [...(sourcePart ? [sourcePart] : []), ...(logoPart ? [logoPart] : []), { text: imagePrompt }] }],
       generationConfig: {
         responseModalities: ["TEXT", "IMAGE"],
         imageConfig: { aspectRatio: "4:5" },
@@ -684,14 +715,15 @@ async function generateCarousel(
   }
   if (!assetId) {
     const sourcePart = await sourceImagePart(db, job, index + 1);
+    const logoPart = await logoImagePart(job, brief);
     const editInstruction = sourcePart ? `The first input is the current version of carousel slide ${index + 1}. Edit that image according to this direction: “${String(job.input.regenerationDirection || "")}”. Preserve everything the direction does not explicitly require changing and return a revised slide rather than an unrelated replacement.\n\n` : "";
     const visualExclusions = imageNegativePrompt(brief.negative_prompt);
-    const prompt = `${editInstruction}${slide.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections consistently across the series; banned treatments are prohibited.\n\nMANDATORY CAROUSEL TYPOGRAPHY: This is a finished carousel slide, not a clean visual plate. The final slide must visibly include the exact headline “${slide.headline}” and supporting line “${slide.body || ""}” as legible, high-contrast editorial typography with correct spelling. Do not omit, paraphrase, or replace this copy, and render no other words. Any earlier instruction that requests no text, typography, letters, words, captions, labels, or writing does not apply to these mandatory overlays. Maintain consistent brand palette, subject, lighting, typography, and visual language across the series.${visualExclusions ? `\n\nVisual exclusions: ${visualExclusions}` : ""}`;
+    const prompt = `${editInstruction}${slide.media_prompt}\n\nMandatory brand style contract: ${mediaStyleContract(job)}. Express these exact selections consistently across the series; banned treatments are prohibited.${logoPart ? `\n\n${logoReferencePrompt(true)}` : ""}\n\nMANDATORY CAROUSEL TYPOGRAPHY: This is a finished carousel slide, not a clean visual plate. The final slide must visibly include the exact headline “${slide.headline}” and supporting line “${slide.body || ""}” as legible, high-contrast editorial typography with correct spelling. Do not omit, paraphrase, or replace this copy, and render no other words besides the supplied brand logo. Any earlier instruction that requests no text, typography, letters, words, captions, labels, logos, brand marks, or writing does not apply to these mandatory overlays or the supplied logo. Maintain consistent brand palette, subject, lighting, typography, and visual language across the series.${visualExclusions ? `\n\nVisual exclusions: ${visualExclusions}` : ""}`;
     const result = await vertex(
       `projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`,
       token,
       {
-        contents: [{ role: "user", parts: [...(sourcePart ? [sourcePart] : []), { text: prompt }] }],
+        contents: [{ role: "user", parts: [...(sourcePart ? [sourcePart] : []), ...(logoPart ? [logoPart] : []), { text: prompt }] }],
         generationConfig: {
           responseModalities: ["TEXT", "IMAGE"],
           imageConfig: { aspectRatio: "4:5" },
