@@ -173,6 +173,13 @@ function imageNegativePrompt(value: string | undefined) {
 }
 
 function veoInputs(brief: CreativeBrief, job: Job) {
+  const production = strategy(job);
+  if (production.pipeline === "veo_reference_ugc") {
+    const character = (job.input?.ugcCharacter || {}) as Record<string, unknown>;
+    const spoken = production.hook || String(brief.text_overlay?.headline?.text || "");
+    const prompt = `Create an authentic creator-style vertical phone video that feels recorded by a real person, not an advertisement or an AI avatar.\n\nON-CAMERA CREATOR\n${String(character.performance_prompt || "An approachable adult creator speaking naturally to camera.")}\nSetting: ${String(character.setting || "a believable lived-in interior")}. Presentation style: ${String(character.presentation_style || "warm and conversational")}.\n\nPERFORMANCE\nThe creator looks into the lens and says exactly: “${spoken.replace(/[“”"]/g, "").slice(0, 180)}”\nUse natural breath, conversational pacing, tiny pauses, realistic blinks, subtle eye and head movement, restrained hand gestures, and accurate lip synchronization. The delivery must be confident but not polished like a commercial. Keep natural skin texture and slight phone-camera exposure variation. One continuous medium close-up take with gentle handheld micro-movement. No cuts, no B-roll, no testimonial claim, no implication of personal product use, and no exaggerated reaction. Vertical 9:16, 8 seconds, 1080p, photorealistic, native synchronized dialogue audio, quiet realistic room tone, no music, no captions, no text, no logos, no watermarks.`;
+    return { prompt, negativePrompt: `${videoTextExclusions}, synthetic avatar look, waxy skin, beauty filter, robotic delivery, frozen face, mismatched lip sync, exaggerated gestures, influencer parody, testimonial claim, jump cuts, scene changes, background music, camera shake, flicker, warped hands` };
+  }
   const prompt = `Create one clean cinematic visual plate from the scene direction below. Treat any references to screens, interfaces, documents, signage, labels, typography, logos, captions, or written copy as visual inspiration only; replace them with unmarked physical objects, abstract light, texture, architecture, or human action. Do not reproduce or invent any writing from the source direction.
 
 SCENE DIRECTION
@@ -1024,7 +1031,7 @@ async function handleVideo(
         durationSeconds: 8,
         sampleCount: 1,
         resolution: "1080p",
-        generateAudio: false,
+        generateAudio: strategy(job).pipeline === "veo_reference_ugc",
         negativePrompt: veo.negativePrompt,
         storageUri,
       },
@@ -1091,6 +1098,8 @@ async function handleVideo(
     musicUrl: selectMusic(brief, job.id),
     qaChecks,
     compositionState: "draft",
+    preserveSourceAudio: strategy(job).pipeline === "veo_reference_ugc",
+    ugcCharacterId: ((job.input?.ugcCharacter || {}) as Record<string, unknown>).id || null,
   });
   if (gcsUri) await removeGcs(gcsUri, token);
 }
