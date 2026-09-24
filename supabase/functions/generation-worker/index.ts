@@ -194,6 +194,23 @@ Execute a single coherent shot with one focal subject, one physically plausible 
   return { prompt, negativePrompt };
 }
 
+async function ugcReferenceImages(job: Job) {
+  if (strategy(job).pipeline !== "veo_reference_ugc") return [];
+  const character = (job.input?.ugcCharacter || {}) as Record<string, unknown>;
+  const value = String(character.portrait_url || "").trim();
+  if (!value) throw new Error("The selected UGC creator has no portrait reference");
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error("The selected UGC creator portrait URL is invalid"); }
+  if (url.protocol !== "https:") throw new Error("The selected UGC creator portrait must use HTTPS");
+  const response = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(20_000) });
+  if (!response.ok) throw new Error(`UGC creator portrait download failed (${response.status})`);
+  const mimeType = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  if (!["image/png", "image/jpeg", "image/webp"].includes(mimeType)) throw new Error("The selected UGC creator portrait is not a supported image");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (!bytes.byteLength || bytes.byteLength > 10_000_000) throw new Error("The selected UGC creator portrait must be smaller than 10 MB");
+  return [{ image: { bytesBase64Encoded: encodeBase64(bytes), mimeType }, referenceType: "asset" }];
+}
+
 async function contentFormat(db: DatabaseClient, job: Job) {
   const supplied = job.input?.contentFormat;
   if (
@@ -1019,13 +1036,14 @@ async function handleVideo(
   if (!job.external_job_id) {
     const brief = savedBrief(job) || (await generateCreativeBrief(job, token));
     const veo = veoInputs(brief, job);
+    const referenceImages = await ugcReferenceImages(job);
     const storageUri = env("VEO_OUTPUT_GCS_URI");
     if (!/^gs:\/\/[^/]+\/?$/.test(storageUri))
       throw new Error(
         "VEO_OUTPUT_GCS_URI must be a Cloud Storage bucket URI such as gs://bucket-name",
       );
     const result = await vertex(`${modelPath}:predictLongRunning`, token, {
-      instances: [{ prompt: veo.prompt }],
+      instances: [{ prompt: veo.prompt, ...(referenceImages.length ? { referenceImages } : {}) }],
       parameters: {
         aspectRatio: "9:16",
         durationSeconds: 8,
@@ -1044,7 +1062,7 @@ async function handleVideo(
       "provider_processing",
       35,
       "waiting_external",
-      { submittedAt: new Date().toISOString(), creativeBrief: brief },
+      { submittedAt: new Date().toISOString(), creativeBrief: brief, referenceCharacterId: ((job.input?.ugcCharacter || {}) as Record<string, unknown>).id || null, referenceImageUsed: referenceImages.length === 1 },
       result.name,
       30,
     );
