@@ -174,10 +174,12 @@ function imageNegativePrompt(value: string | undefined) {
 
 function veoInputs(brief: CreativeBrief, job: Job) {
   const production = strategy(job);
-  if (production.pipeline === "veo_reference_ugc") {
+  if (["veo_reference_ugc", "veo_product_ugc"].includes(production.pipeline)) {
     const character = (job.input?.ugcCharacter || {}) as Record<string, unknown>;
     const spoken = production.hook || String(brief.text_overlay?.headline?.text || "");
-    const prompt = `Create an authentic creator-style vertical phone video that feels recorded by a real person, not an advertisement or an AI avatar.\n\nON-CAMERA CREATOR\n${String(character.performance_prompt || "An approachable adult creator speaking naturally to camera.")}\nSetting: ${String(character.setting || "a believable lived-in interior")}. Presentation style: ${String(character.presentation_style || "warm and conversational")}.\n\nPERFORMANCE\nThe creator looks into the lens and says exactly: “${spoken.replace(/[“”"]/g, "").slice(0, 180)}”\nUse natural breath, conversational pacing, tiny pauses, realistic blinks, subtle eye and head movement, restrained hand gestures, and accurate lip synchronization. The delivery must be confident but not polished like a commercial. Keep natural skin texture and slight phone-camera exposure variation. One continuous medium close-up take with gentle handheld micro-movement. No cuts, no B-roll, no testimonial claim, no implication of personal product use, and no exaggerated reaction. Vertical 9:16, 8 seconds, 1080p, photorealistic, native synchronized dialogue audio, quiet realistic room tone, no music, no captions, no text, no logos, no watermarks.`;
+    const product = (job.input?.product || {}) as Record<string, unknown>;
+    const productDirection = production.pipeline === "veo_product_ugc" ? ` The creator must naturally hold, present, and demonstrate the exact product shown in the PRODUCT IDENTITY reference images. Product: ${String(product.name || "")}. Preserve its exact shape, proportions, materials, colors, packaging, logo, and label layout in every frame. Keep the product clearly visible and never morph, relabel, duplicate, redesign, or substitute it.` : "";
+    const prompt = `Create an authentic creator-style vertical phone video that feels recorded by a real person, not an advertisement or an AI avatar.\n\nON-CAMERA CREATOR\n${String(character.performance_prompt || "An approachable adult creator speaking naturally to camera.")}\nSetting: ${String(character.setting || "a believable lived-in interior")}. Presentation style: ${String(character.presentation_style || "warm and conversational")}.\n\nPERFORMANCE\nThe creator looks into the lens and says exactly: “${spoken.replace(/[“”"]/g, "").slice(0, 180)}”\nUse natural breath, conversational pacing, tiny pauses, realistic blinks, subtle eye and head movement, restrained hand gestures, and accurate lip synchronization. The delivery must be confident but not polished like a commercial. Keep natural skin texture and slight phone-camera exposure variation. One continuous medium close-up take with gentle handheld micro-movement. No cuts, no B-roll, no testimonial claim, no implication of personal product use, and no exaggerated reaction.${productDirection} Vertical 9:16, 8 seconds, 1080p, photorealistic, native synchronized dialogue audio, quiet realistic room tone, no music, no captions, no text, no logos, no watermarks.`;
     return { prompt, negativePrompt: `${videoTextExclusions}, synthetic avatar look, waxy skin, beauty filter, robotic delivery, frozen face, mismatched lip sync, exaggerated gestures, influencer parody, testimonial claim, jump cuts, scene changes, background music, camera shake, flicker, warped hands` };
   }
   const prompt = `Create one clean cinematic visual plate from the scene direction below. Treat any references to screens, interfaces, documents, signage, labels, typography, logos, captions, or written copy as visual inspiration only; replace them with unmarked physical objects, abstract light, texture, architecture, or human action. Do not reproduce or invent any writing from the source direction.
@@ -194,8 +196,8 @@ Execute a single coherent shot with one focal subject, one physically plausible 
   return { prompt, negativePrompt };
 }
 
-async function ugcReferenceImages(job: Job) {
-  if (strategy(job).pipeline !== "veo_reference_ugc") return [];
+async function ugcReferenceImages(db: DatabaseClient, job: Job) {
+  if (!["veo_reference_ugc", "veo_product_ugc"].includes(strategy(job).pipeline)) return [];
   const character = (job.input?.ugcCharacter || {}) as Record<string, unknown>;
   const value = String(character.portrait_url || "").trim();
   if (!value) throw new Error("The selected UGC creator has no portrait reference");
@@ -208,7 +210,23 @@ async function ugcReferenceImages(job: Job) {
   if (!["image/png", "image/jpeg", "image/webp"].includes(mimeType)) throw new Error("The selected UGC creator portrait is not a supported image");
   const bytes = new Uint8Array(await response.arrayBuffer());
   if (!bytes.byteLength || bytes.byteLength > 10_000_000) throw new Error("The selected UGC creator portrait must be smaller than 10 MB");
-  return [{ image: { bytesBase64Encoded: encodeBase64(bytes), mimeType }, referenceType: "asset" }];
+  const references = [{ image: { bytesBase64Encoded: encodeBase64(bytes), mimeType }, referenceType: "asset" }];
+  if (strategy(job).pipeline === "veo_product_ugc") {
+    const product = (job.input?.product || {}) as Record<string, unknown>;
+    const assets = Array.isArray(product.assets) ? product.assets.slice(0, 2) as Array<Record<string, unknown>> : [];
+    if (!assets.length) throw new Error("Product UGC requires at least one product identity image");
+    for (const asset of assets) {
+      const bucket = String(asset.storage_bucket || ""); const path = String(asset.storage_path || "");
+      if (!bucket || !path) throw new Error("A product identity reference is incomplete");
+      const downloaded = await db.storage.from(bucket).download(path);
+      if (downloaded.error || !downloaded.data) throw new Error(`Product identity reference download failed: ${downloaded.error?.message || "empty asset"}`);
+      const productBytes = new Uint8Array(await downloaded.data.arrayBuffer());
+      const productMime = String(asset.mime_type || downloaded.data.type || "image/png");
+      if (!productMime.startsWith("image/") || !productBytes.byteLength || productBytes.byteLength > 10_000_000) throw new Error("A product identity reference is invalid or too large");
+      references.push({ image: { bytesBase64Encoded: encodeBase64(productBytes), mimeType: productMime }, referenceType: "asset" });
+    }
+  }
+  return references;
 }
 
 async function contentFormat(db: DatabaseClient, job: Job) {
@@ -1036,7 +1054,7 @@ async function handleVideo(
   if (!job.external_job_id) {
     const brief = savedBrief(job) || (await generateCreativeBrief(job, token));
     const veo = veoInputs(brief, job);
-    const referenceImages = await ugcReferenceImages(job);
+    const referenceImages = await ugcReferenceImages(db, job);
     const storageUri = env("VEO_OUTPUT_GCS_URI");
     if (!/^gs:\/\/[^/]+\/?$/.test(storageUri))
       throw new Error(
@@ -1049,7 +1067,7 @@ async function handleVideo(
         durationSeconds: 8,
         sampleCount: 1,
         resolution: "1080p",
-        generateAudio: strategy(job).pipeline === "veo_reference_ugc",
+        generateAudio: ["veo_reference_ugc", "veo_product_ugc"].includes(strategy(job).pipeline),
         negativePrompt: veo.negativePrompt,
         storageUri,
       },
@@ -1062,7 +1080,7 @@ async function handleVideo(
       "provider_processing",
       35,
       "waiting_external",
-      { submittedAt: new Date().toISOString(), creativeBrief: brief, referenceCharacterId: ((job.input?.ugcCharacter || {}) as Record<string, unknown>).id || null, referenceImageUsed: referenceImages.length === 1 },
+      { submittedAt: new Date().toISOString(), creativeBrief: brief, referenceCharacterId: ((job.input?.ugcCharacter || {}) as Record<string, unknown>).id || null, referenceImageUsed: referenceImages.length >= 1, referenceImageCount: referenceImages.length, productId: ((job.input?.product || {}) as Record<string, unknown>).id || null },
       result.name,
       30,
     );
@@ -1116,7 +1134,7 @@ async function handleVideo(
     musicUrl: selectMusic(brief, job.id),
     qaChecks,
     compositionState: "draft",
-    preserveSourceAudio: strategy(job).pipeline === "veo_reference_ugc",
+    preserveSourceAudio: ["veo_reference_ugc", "veo_product_ugc"].includes(strategy(job).pipeline),
     ugcCharacterId: ((job.input?.ugcCharacter || {}) as Record<string, unknown>).id || null,
   });
   if (gcsUri) await removeGcs(gcsUri, token);
