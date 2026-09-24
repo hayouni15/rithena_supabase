@@ -196,6 +196,14 @@ Execute a single coherent shot with one focal subject, one physically plausible 
   return { prompt, negativePrompt };
 }
 
+function imageMimeFromBytes(bytes: Uint8Array, declared = "") {
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" && String.fromCharCode(...bytes.slice(8, 12)) === "WEBP") return "image/webp";
+  const normalized = declared.split(";")[0].trim().toLowerCase();
+  return ["image/png", "image/jpeg", "image/webp"].includes(normalized) ? normalized : null;
+}
+
 async function ugcReferenceImages(db: DatabaseClient, job: Job) {
   if (!["veo_reference_ugc", "veo_product_ugc"].includes(strategy(job).pipeline)) return [];
   const character = (job.input?.ugcCharacter || {}) as Record<string, unknown>;
@@ -206,10 +214,10 @@ async function ugcReferenceImages(db: DatabaseClient, job: Job) {
   if (url.protocol !== "https:") throw new Error("The selected UGC creator portrait must use HTTPS");
   const response = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(20_000) });
   if (!response.ok) throw new Error(`UGC creator portrait download failed (${response.status})`);
-  const mimeType = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
-  if (!["image/png", "image/jpeg", "image/webp"].includes(mimeType)) throw new Error("The selected UGC creator portrait is not a supported image");
   const bytes = new Uint8Array(await response.arrayBuffer());
   if (!bytes.byteLength || bytes.byteLength > 10_000_000) throw new Error("The selected UGC creator portrait must be smaller than 10 MB");
+  const mimeType = imageMimeFromBytes(bytes, response.headers.get("content-type") || "");
+  if (!mimeType) throw new Error("The selected UGC creator portrait is not a supported PNG, JPEG, or WebP image");
   const references = [{ image: { bytesBase64Encoded: encodeBase64(bytes), mimeType }, referenceType: "asset" }];
   if (strategy(job).pipeline === "veo_product_ugc") {
     const product = (job.input?.product || {}) as Record<string, unknown>;
@@ -221,8 +229,9 @@ async function ugcReferenceImages(db: DatabaseClient, job: Job) {
       const downloaded = await db.storage.from(bucket).download(path);
       if (downloaded.error || !downloaded.data) throw new Error(`Product identity reference download failed: ${downloaded.error?.message || "empty asset"}`);
       const productBytes = new Uint8Array(await downloaded.data.arrayBuffer());
-      const productMime = String(asset.mime_type || downloaded.data.type || "image/png");
-      if (!productMime.startsWith("image/") || !productBytes.byteLength || productBytes.byteLength > 10_000_000) throw new Error("A product identity reference is invalid or too large");
+      if (!productBytes.byteLength || productBytes.byteLength > 10_000_000) throw new Error("A product identity reference is invalid or too large");
+      const productMime = imageMimeFromBytes(productBytes, String(asset.mime_type || downloaded.data.type || ""));
+      if (!productMime) throw new Error("A product identity reference is not a supported PNG, JPEG, or WebP image");
       references.push({ image: { bytesBase64Encoded: encodeBase64(productBytes), mimeType: productMime }, referenceType: "asset" });
     }
   }
