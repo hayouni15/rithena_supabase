@@ -179,7 +179,7 @@ function veoInputs(brief: CreativeBrief, job: Job) {
     const spoken = production.hook || String(brief.text_overlay?.headline?.text || "");
     const product = (job.input?.product || {}) as Record<string, unknown>;
     const productDirection = production.pipeline === "veo_product_ugc" ? ` The creator must naturally hold, present, and demonstrate the exact product shown in the PRODUCT IDENTITY reference images. Product: ${String(product.name || "")}. Preserve its exact shape, proportions, materials, colors, packaging, logo, and label layout in every frame. Keep the product clearly visible and never morph, relabel, duplicate, redesign, or substitute it.` : "";
-    const prompt = `Create an authentic creator-style vertical phone video that feels recorded by a real person, not an advertisement or an AI avatar.\n\nON-CAMERA CREATOR\n${String(character.performance_prompt || "An approachable adult creator speaking naturally to camera.")}\nSetting: ${String(character.setting || "a believable lived-in interior")}. Presentation style: ${String(character.presentation_style || "warm and conversational")}.\n\nPERFORMANCE\nThe creator looks into the lens and says exactly: “${spoken.replace(/[“”"]/g, "").slice(0, 180)}”\nUse natural breath, conversational pacing, tiny pauses, realistic blinks, subtle eye and head movement, restrained hand gestures, and accurate lip synchronization. The delivery must be confident but not polished like a commercial. Keep natural skin texture and slight phone-camera exposure variation. One continuous medium close-up take with gentle handheld micro-movement. No cuts, no B-roll, no testimonial claim, no implication of personal product use, and no exaggerated reaction.${productDirection} Vertical 9:16, 8 seconds, 1080p, photorealistic, native synchronized dialogue audio, quiet realistic room tone, no music, no captions, no text, no logos, no watermarks.`;
+    const prompt = `Create an authentic creator-style vertical phone video that feels recorded by a real person, not an advertisement or an AI avatar.\n\nON-CAMERA CREATOR\nUse the CREATOR IDENTITY reference image as the absolute identity source for ${String(character.name || "the selected creator")}. Preserve the same face, facial structure, skin tone, hair, apparent age, and overall identity in every frame. Place the creator in a believable lived-in interior with a warm, conversational delivery.\n\nPERFORMANCE\nThe creator looks into the lens and says exactly: “${spoken.replace(/[“”"]/g, "").slice(0, 180)}”\nUse natural breath, conversational pacing, tiny pauses, realistic blinks, subtle eye and head movement, restrained hand gestures, and accurate lip synchronization. The delivery must be confident but not polished like a commercial. Keep natural skin texture and slight phone-camera exposure variation. One continuous medium close-up take with gentle handheld micro-movement. No cuts, no B-roll, no testimonial claim, no implication of personal product use, and no exaggerated reaction.${productDirection} Vertical 9:16, 8 seconds, 1080p, photorealistic, native synchronized dialogue audio, quiet realistic room tone, no music, no captions, no text, no logos, no watermarks.`;
     return { prompt, negativePrompt: `${videoTextExclusions}, synthetic avatar look, waxy skin, beauty filter, robotic delivery, frozen face, mismatched lip sync, exaggerated gestures, influencer parody, testimonial claim, jump cuts, scene changes, background music, camera shake, flicker, warped hands` };
   }
   const prompt = `Create one clean cinematic visual plate from the scene direction below. Treat any references to screens, interfaces, documents, signage, labels, typography, logos, captions, or written copy as visual inspiration only; replace them with unmarked physical objects, abstract light, texture, architecture, or human action. Do not reproduce or invent any writing from the source direction.
@@ -207,17 +207,17 @@ function imageMimeFromBytes(bytes: Uint8Array, declared = "") {
 async function ugcReferenceImages(db: DatabaseClient, job: Job) {
   if (!["veo_reference_ugc", "veo_product_ugc"].includes(strategy(job).pipeline)) return [];
   const character = (job.input?.ugcCharacter || {}) as Record<string, unknown>;
-  const value = String(character.portrait_url || "").trim();
-  if (!value) throw new Error("The selected UGC creator has no portrait reference");
+  const value = String(character.selfie_image || character.portrait_url || "").trim();
+  if (!value) throw new Error("The selected UGC creator has no selfie reference");
   let url: URL;
-  try { url = new URL(value); } catch { throw new Error("The selected UGC creator portrait URL is invalid"); }
-  if (url.protocol !== "https:") throw new Error("The selected UGC creator portrait must use HTTPS");
+  try { url = new URL(value); } catch { throw new Error("The selected UGC creator selfie URL is invalid"); }
+  if (url.protocol !== "https:") throw new Error("The selected UGC creator selfie must use HTTPS");
   const response = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(20_000) });
-  if (!response.ok) throw new Error(`UGC creator portrait download failed (${response.status})`);
+  if (!response.ok) throw new Error(`UGC creator selfie download failed (${response.status})`);
   const bytes = new Uint8Array(await response.arrayBuffer());
-  if (!bytes.byteLength || bytes.byteLength > 10_000_000) throw new Error("The selected UGC creator portrait must be smaller than 10 MB");
+  if (!bytes.byteLength || bytes.byteLength > 10_000_000) throw new Error("The selected UGC creator selfie must be smaller than 10 MB");
   const mimeType = imageMimeFromBytes(bytes, response.headers.get("content-type") || "");
-  if (!mimeType) throw new Error("The selected UGC creator portrait is not a supported PNG, JPEG, or WebP image");
+  if (!mimeType) throw new Error("The selected UGC creator selfie is not a supported PNG, JPEG, or WebP image");
   const references = [{ image: { bytesBase64Encoded: encodeBase64(bytes), mimeType }, referenceType: "asset" }];
   if (strategy(job).pipeline === "veo_product_ugc") {
     const product = (job.input?.product || {}) as Record<string, unknown>;
