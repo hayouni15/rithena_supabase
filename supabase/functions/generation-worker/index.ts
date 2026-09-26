@@ -340,7 +340,7 @@ async function generateCreativeBrief(job: Job, token: string) {
                   properties: Object.fromEntries(
                     ["instagram", "facebook", "linkedin", "tiktok", "youtube"].map((platform) => [
                       platform,
-                      { type: "ARRAY", minItems: ["facebook", "linkedin"].includes(platform) ? 5 : 10, maxItems: ["facebook", "linkedin"].includes(platform) ? 5 : 10, items: { type: "STRING" } },
+                      { type: "ARRAY", minItems: 1, items: { type: "STRING" } },
                     ]),
                   ),
                 },
@@ -366,13 +366,11 @@ async function generateCreativeBrief(job: Job, token: string) {
     const strategy = (job.input?.strategy || {}) as Record<string, unknown>;
     const brandName = String(brain.name || "").trim();
     const platforms = Array.isArray(strategy.platforms) ? strategy.platforms.map(String) : [];
-    const expectedHashtags: Record<string, number> = { instagram: 10, tiktok: 10, youtube: 10, facebook: 5, linkedin: 5 };
     const failures: string[] = [];
     if (brandName && !brief.social_post.caption.toLocaleLowerCase().includes(brandName.toLocaleLowerCase())) failures.push(`caption must contain the exact brand name ${JSON.stringify(brandName)}`);
     for (const platform of platforms) {
       const hashtags = brief.social_post.hashtags?.[platform] || [];
-      const expected = expectedHashtags[platform];
-      if (expected && hashtags.length !== expected) failures.push(`${platform} must contain exactly ${expected} hashtags, received ${hashtags.length}`);
+      if (hashtags.length < 1) failures.push(`${platform} must contain at least one hashtag`);
       if (new Set(hashtags.map((tag) => tag.toLocaleLowerCase())).size !== hashtags.length) failures.push(`${platform} hashtags must be distinct`);
       if (hashtags.some((tag) => !/^#[^\s#]+$/.test(tag))) failures.push(`${platform} contains an invalid hashtag entry`);
     }
@@ -1031,6 +1029,7 @@ async function storeRawVideo(
   job: Job,
   source: ReadableStream<Uint8Array>,
   bytes: number,
+  preserveSourceAudio: boolean,
 ) {
   const path = `${job.organization_id}/${job.content_item_id}/${job.id}.raw.mp4`;
   const upload = await db.storage
@@ -1045,6 +1044,7 @@ async function storeRawVideo(
   const assetId = await recordVideoAsset(db, job, path, bytes || null, {
     compositionState: "draft",
     rawMaster: true,
+    preserveSourceAudio,
   });
   return { assetId, path, bytes };
 }
@@ -1127,7 +1127,8 @@ async function handleVideo(
   const rawVideo = await downloadGcs(gcsUri, token);
   const brief = savedBrief(job);
   if (!brief) throw new Error("The saved creative brief is missing");
-  const video = await storeRawVideo(db, job, rawVideo.body, rawVideo.bytes);
+  const preserveSourceAudio = ["veo_reference_ugc", "veo_product_ugc"].includes(strategy(job).pipeline);
+  const video = await storeRawVideo(db, job, rawVideo.body, rawVideo.bytes, preserveSourceAudio);
   await savePlatformCopy(db, job, video.assetId, brief, "short_video");
   const qaChecks = await completeQa(db, job, video.assetId, brief, {
     mimeType: "video/mp4",
@@ -1143,7 +1144,7 @@ async function handleVideo(
     musicUrl: selectMusic(brief, job.id),
     qaChecks,
     compositionState: "draft",
-    preserveSourceAudio: ["veo_reference_ugc", "veo_product_ugc"].includes(strategy(job).pipeline),
+    preserveSourceAudio,
     ugcCharacterId: ((job.input?.ugcCharacter || {}) as Record<string, unknown>).id || null,
   });
   if (gcsUri) await removeGcs(gcsUri, token);
