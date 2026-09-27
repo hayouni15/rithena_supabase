@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { AwsClient } from "aws4fetch";
 import { createClient } from "@supabase/supabase-js";
 
@@ -19,9 +20,22 @@ const required = (name) => {
   return value;
 };
 
+function productionServiceKey() {
+  if (process.env.PROD_SERVICE_ROLE_KEY?.trim()) return process.env.PROD_SERVICE_ROLE_KEY.trim();
+  const result = spawnSync("supabase", ["projects", "api-keys", "--project-ref", required("PROD_PROJECT_REF"), "--output", "json"], {
+    env: { ...process.env, SUPABASE_ACCESS_TOKEN: required("PROD_ACCESS_TOKEN") },
+    encoding: "utf8",
+  });
+  if (result.error || result.status !== 0) throw new Error("Could not retrieve the production service-role key from Supabase management.");
+  const keys = JSON.parse(result.stdout);
+  const key = Array.isArray(keys) && keys.find((entry) => entry.name === "service_role" && entry.type === "legacy")?.api_key;
+  if (typeof key !== "string" || !key) throw new Error("The production project has no readable service-role key.");
+  return key;
+}
+
 const staging = process.argv.includes("--staging");
 const projectRef = required(staging ? "STAGING_PROJECT_REF" : "PROD_PROJECT_REF");
-const secretKey = required(staging ? "SUPABASE_SERVICE_ROLE_KEY" : "PROD_SERVICE_ROLE_KEY");
+const secretKey = staging ? required("SUPABASE_SERVICE_ROLE_KEY") : productionServiceKey();
 const supabase = createClient(`https://${projectRef}.supabase.co`, secretKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });

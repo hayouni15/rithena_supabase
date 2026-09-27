@@ -13,7 +13,7 @@ Set these server-side values in both Vercel Production environment variables and
 - `OCI_NAMESPACE=axr2mzsugevy`
 - `OCI_REGION=ca-montreal-1`
 
-For a local migration, put the same values in an ignored `rithena_supabase/.env` or `rithena/.env` file. A production data migration additionally requires `PROD_SERVICE_ROLE_KEY` for the **same** project as `PROD_PROJECT_REF`; staging uses its matching `SUPABASE_SERVICE_ROLE_KEY`. The script checks that the target media schema is readable before any storage action. The backend's `npm run storage:secrets:prod` publishes the OCI values to Supabase secrets after `PROD_PROJECT_REF` and `PROD_ACCESS_TOKEN` are configured. Configure the OCI values in Vercel's Production environment and redeploy the Next.js app; Edge Function secrets do not reach Vercel.
+For a local migration, put the same OCI values in an ignored `rithena_supabase/.env` or `rithena/.env` file. Production uses `PROD_SERVICE_ROLE_KEY` if provided; otherwise the migration obtains the matching service-role key in memory through the authenticated Supabase CLI using `PROD_ACCESS_TOKEN`. Staging uses its matching `SUPABASE_SERVICE_ROLE_KEY`. The script checks that the target media schema is readable before any storage action. The backend's `npm run storage:secrets:prod` publishes the OCI values to Supabase secrets after `PROD_PROJECT_REF` and `PROD_ACCESS_TOKEN` are configured. Configure the OCI values in Vercel's Production environment and redeploy the Next.js app; Edge Function secrets do not reach Vercel.
 
 ## Cutover order
 
