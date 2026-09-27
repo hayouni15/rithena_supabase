@@ -508,8 +508,7 @@ async function storeAsset(
           ? "webp"
           : "png";
   const path = `${job.organization_id}/${job.content_item_id}/${job.id}${options.suffix || ""}.${extension}`;
-  const upload = await db.storage
-    .from("creative-media")
+  const upload = await storageFrom(db, "creative-media")
     .upload(path, bytes, { contentType: mimeType, upsert: false });
   if (
     upload.error &&
@@ -1033,8 +1032,7 @@ async function storeRawVideo(
   preserveSourceAudio: boolean,
 ) {
   const path = `${job.organization_id}/${job.content_item_id}/${job.id}.raw.mp4`;
-  const upload = await db.storage
-    .from("creative-media")
+  const upload = await storageFrom(db, "creative-media")
     .upload(path, source, {
       contentType: "video/mp4",
       upsert: true,

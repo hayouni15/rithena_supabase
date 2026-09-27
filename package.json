@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "migration:new": "npx supabase migration new",
+    "storage:check": "node scripts/check-storage-routing.mjs",
     "db:dry:staging": "npx dotenv -e .env -- sh -c 'SUPABASE_ACCESS_TOKEN=$STAGING_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$STAGING_DB_PASSWORD npx supabase link --project-ref $STAGING_PROJECT_REF && SUPABASE_ACCESS_TOKEN=$STAGING_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$STAGING_DB_PASSWORD npx supabase db push --dry-run'",
     "db:push:staging": "npx dotenv -e .env -- sh -c 'SUPABASE_ACCESS_TOKEN=$STAGING_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$STAGING_DB_PASSWORD npx supabase link --project-ref $STAGING_PROJECT_REF && SUPABASE_ACCESS_TOKEN=$STAGING_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$STAGING_DB_PASSWORD npx supabase db push'",
     "db:dry:prod": "npx dotenv -e .env -- sh -c 'SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$PROD_DB_PASSWORD npx supabase link --project-ref $PROD_PROJECT_REF && SUPABASE_ACCESS_TOKEN=$PROD_ACCESS_TOKEN SUPABASE_DB_PASSWORD=$PROD_DB_PASSWORD npx supabase db push --dry-run'",
