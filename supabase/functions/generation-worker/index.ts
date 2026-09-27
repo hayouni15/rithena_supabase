@@ -1,4 +1,5 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { storageFrom } from "../_shared/storage.ts";
 import {
   creativeBriefPrompt,
   parseCreativeBrief,
@@ -226,7 +227,7 @@ async function ugcReferenceImages(db: DatabaseClient, job: Job) {
     for (const asset of assets) {
       const bucket = String(asset.storage_bucket || ""); const path = String(asset.storage_path || "");
       if (!bucket || !path) throw new Error("A product identity reference is incomplete");
-      const downloaded = await db.storage.from(bucket).download(path);
+      const downloaded = await storageFrom(db,bucket).download(path);
       if (downloaded.error || !downloaded.data) throw new Error(`Product identity reference download failed: ${downloaded.error?.message || "empty asset"}`);
       const productBytes = new Uint8Array(await downloaded.data.arrayBuffer());
       if (!productBytes.byteLength || productBytes.byteLength > 10_000_000) throw new Error("A product identity reference is invalid or too large");
@@ -577,7 +578,7 @@ async function sourceImagePart(
       })
     : source.data?.[0];
   if (!asset) throw new Error(slideIndex ? `Current carousel slide ${slideIndex} is unavailable for modification` : "The current image is unavailable for modification");
-  const downloaded = await db.storage.from(asset.storage_bucket).download(asset.storage_path);
+  const downloaded = await storageFrom(db,asset.storage_bucket).download(asset.storage_path);
   if (downloaded.error || !downloaded.data) throw new Error(`Source image download failed: ${downloaded.error?.message || "empty asset"}`);
   const bytes = new Uint8Array(await downloaded.data.arrayBuffer());
   return { inlineData: { data: encodeBase64(bytes), mimeType: asset.mime_type || downloaded.data.type || "image/png" } };

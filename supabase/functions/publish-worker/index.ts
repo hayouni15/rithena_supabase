@@ -1,4 +1,5 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { storageFrom } from "../_shared/storage.ts";
 
 type Json = Record<string, unknown>;
 type Job = { id:string; organization_id:string; content_item_id:string; platform_variant_id:string; social_connection_id:string; content_revision:number; state:string; provider_job_id:string|null; provider_payload:Json; attempt:number; max_attempts:number };
@@ -80,7 +81,7 @@ async function resources(db:Db,job:Job){
 }
 
 async function signedUrl(db:Db,asset:{storage_bucket:string;storage_path:string}){
-  const signed=await db.storage.from(asset.storage_bucket).createSignedUrl(asset.storage_path,21600);
+  const signed=await storageFrom(db,asset.storage_bucket).createSignedUrl(asset.storage_path,21600);
   if(signed.error||!signed.data?.signedUrl) throw new PublishError("media_delivery_failed","The approved media could not be prepared for Instagram.",true);
   return signed.data.signedUrl as string;
 }
@@ -121,7 +122,7 @@ async function linkedin(path:string,token:string,init:RequestInit={},ambiguous=f
   if(!response.ok){const message=String(body.message||body.errorDetails||"LinkedIn rejected this post.").slice(0,400);if(response.status===401)throw new PublishError("linkedin_revoked","LinkedIn access was removed or expired. Reconnect the Company Page, then reschedule.",false);if(response.status===403)throw new PublishError("linkedin_permissions","LinkedIn no longer allows publishing for this Company Page. Reconnect it and grant publishing access.",false);if(response.status===429||response.status>=500)throw new PublishError("linkedin_unavailable","LinkedIn is temporarily unavailable. Rithena will retry automatically.",true);throw new PublishError(`linkedin_${response.status}`,message,false);}
   return {body,response};
 }
-async function assetBytes(db:Db,asset:{storage_bucket:string;storage_path:string}){const result=await db.storage.from(asset.storage_bucket).download(asset.storage_path);if(result.error||!result.data)throw new PublishError("media_delivery_failed","The approved media could not be prepared for LinkedIn.",true);return new Uint8Array(await result.data.arrayBuffer());}
+async function assetBytes(db:Db,asset:{storage_bucket:string;storage_path:string}){const result=await storageFrom(db,asset.storage_bucket).download(asset.storage_path);if(result.error||!result.data)throw new PublishError("media_delivery_failed","The approved media could not be prepared for LinkedIn.",true);return new Uint8Array(await result.data.arrayBuffer());}
 async function uploadLinkedInImage(db:Db,asset:{storage_bucket:string;storage_path:string;mime_type:string},owner:string,token:string){
   const initialized=await linkedin("images?action=initializeUpload",token,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({initializeUploadRequest:{owner}})});const value=initialized.body.value as Json|undefined;const uploadUrl=String(value?.uploadUrl||"");const image=String(value?.image||"");if(!uploadUrl||!image)throw new PublishError("linkedin_invalid_response","LinkedIn did not initialize the image upload.",true);
   const bytes=await assetBytes(db,asset);const response=await fetch(uploadUrl,{method:"PUT",headers:{authorization:`Bearer ${token}`,"content-type":asset.mime_type||"application/octet-stream"},body:bytes,signal:AbortSignal.timeout(90_000)});if(!response.ok)throw new PublishError(response.status>=500?"linkedin_unavailable":"linkedin_upload_failed","LinkedIn could not upload the image.",response.status>=500);return image;

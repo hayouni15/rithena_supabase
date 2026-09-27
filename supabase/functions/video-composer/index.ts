@@ -1,14 +1,15 @@
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.57.4";
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.112.4";
+import { storageFrom } from "../_shared/storage.ts";
 
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void };
 
 const json=(body:Record<string,unknown>,status=200)=>new Response(JSON.stringify(body),{status,headers:{"content-type":"application/json","cache-control":"no-store"}});
 const env=(name:string)=>{const value=Deno.env.get(name);if(!value)throw new Error(`${name} is not configured`);return value;};
 
-async function renderVideo(admin: ReturnType<typeof createClient>, item: {id:string;organization_id:string;content_revision:number}, raw: {id:string;storage_bucket:string;storage_path:string}, composition: Record<string,unknown>&{duration:number;overlays:Array<{id:string;text:string}>;audio:{url:string}}, requestId: string) {
+async function renderVideo(admin: SupabaseClient<any>, item: {id:string;organization_id:string;content_revision:number}, raw: {id:string;storage_bucket:string;storage_path:string;metadata:unknown}, composition: Record<string,unknown>&{duration:number;overlays:Array<{id:string;text:string}>;audio:{url:string}}, requestId: string) {
   try {
     const finalPath=`${item.organization_id}/${item.id}/composition-${item.content_revision}-${Date.now()}.mp4`;
-    const [source,upload]=await Promise.all([admin.storage.from(raw.storage_bucket).createSignedUrl(raw.storage_path,900),admin.storage.from("creative-media").createSignedUploadUrl(finalPath)]);
+    const [source,upload]=await Promise.all([storageFrom(admin,raw.storage_bucket).createSignedUrl(raw.storage_path,900),storageFrom(admin,"creative-media").createSignedUploadUrl(finalPath)]);
     if(source.error||upload.error||!source.data?.signedUrl||!upload.data?.signedUrl)throw new Error("Secure render URLs could not be created.");
     const response=await fetch(`${env("MEDIA_COMPOSER_URL").replace(/\/$/,"")}/compose`,{method:"POST",headers:{authorization:`Bearer ${env("MEDIA_COMPOSER_SECRET")}`,"content-type":"application/json"},body:JSON.stringify({sourceUrl:source.data.signedUrl,outputUploadUrl:upload.data.signedUrl,durationSeconds:composition.duration,overlays:composition.overlays,logo:composition.logo,musicUrl:composition.audio.url,audio:composition.audio,preserveSourceAudio:(raw.metadata as Record<string,unknown>)?.preserveSourceAudio===true}),signal:AbortSignal.timeout(150_000)});
     if(!response.ok)throw new Error("The media renderer could not complete this video.");
@@ -27,7 +28,7 @@ async function renderVideo(admin: ReturnType<typeof createClient>, item: {id:str
 Deno.serve(async(request)=>{
   if(request.method!=="POST")return json({error:"Method not allowed"},405);
   const supplied=request.headers.get("x-rithena-internal-secret")||"";if(!supplied||supplied!==env("VIDEO_COMPOSER_INTERNAL_SECRET"))return json({error:"Unauthorized"},401);
-  const admin=createClient(env("SUPABASE_URL"),env("SUPABASE_SERVICE_ROLE_KEY"),{auth:{persistSession:false}});
+  const admin=createClient<any>(env("SUPABASE_URL"),env("SUPABASE_SERVICE_ROLE_KEY"),{auth:{persistSession:false}});
   const body=await request.json() as {contentItemId:string;assetId:string;requestId:string;composition:Record<string,unknown>&{duration:number;overlays:Array<{id:string;text:string}>;audio:{url:string}}};
   const {data:item}=await admin.from("content_items").select("id,organization_id,status,content_revision").eq("id",body.contentItemId).maybeSingle();if(!item||!["ready_for_review","approved"].includes(item.status))return json({error:"This video is not ready for composition."},409);
   const {data:raw}=await admin.from("media_assets").select("id,storage_bucket,storage_path,metadata").eq("id",body.assetId).eq("content_item_id",item.id).eq("organization_id",item.organization_id).maybeSingle();if(!raw||(raw.metadata as Record<string,unknown>)?.rawMaster!==true)return json({error:"The raw video master is unavailable."},404);
