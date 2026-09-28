@@ -12,7 +12,7 @@ async function renderVideo(admin: SupabaseClient<any>, item: {id:string;organiza
     const [source,upload]=await Promise.all([storageFrom(admin,raw.storage_bucket).createSignedUrl(raw.storage_path,900),storageFrom(admin,"creative-media").createSignedUploadUrl(finalPath)]);
     if(source.error||upload.error||!source.data?.signedUrl||!upload.data?.signedUrl)throw new Error("Secure render URLs could not be created.");
     const response=await fetch(`${env("MEDIA_COMPOSER_URL").replace(/\/$/,"")}/compose`,{method:"POST",headers:{authorization:`Bearer ${env("MEDIA_COMPOSER_SECRET")}`,"content-type":"application/json"},body:JSON.stringify({sourceUrl:source.data.signedUrl,outputUploadUrl:upload.data.signedUrl,durationSeconds:composition.duration,overlays:composition.overlays,logo:composition.logo,musicUrl:composition.audio.url,audio:composition.audio,preserveSourceAudio:(raw.metadata as Record<string,unknown>)?.preserveSourceAudio===true}),signal:AbortSignal.timeout(150_000)});
-    if(!response.ok)throw new Error("The media renderer could not complete this video.");
+    if(!response.ok)throw new Error(`The media renderer failed (HTTP ${response.status}).`);
     const result=await response.json() as {bytes?:number};
     const {data:asset,error}=await admin.from("media_assets").insert({organization_id:item.organization_id,content_item_id:item.id,asset_type:"video",origin:"generated",status:"ready",storage_bucket:"creative-media",storage_path:finalPath,mime_type:"video/mp4",file_size_bytes:result.bytes||null,provider:"media-composer",metadata:{rawMaster:false,compositionState:"rendered",renderRequestId:requestId,sourceAssetId:raw.id,composition}}).select("id").single();
     if(error||!asset)throw new Error("The rendered video could not be recorded.");
@@ -20,8 +20,13 @@ async function renderVideo(admin: SupabaseClient<any>, item: {id:string;organiza
     const {data:variants}=await admin.from("platform_variants").select("id,post_copies(locale,caption,hashtags,title,description,version,is_selected)").eq("content_item_id",item.id).eq("organization_id",item.organization_id);
     for(const variant of variants||[]){const selected=[...(variant.post_copies||[])].sort((a,b)=>Number(b.is_selected)-Number(a.is_selected)||b.version-a.version)[0];if(!selected)continue;await admin.from("post_copies").update({is_selected:false}).eq("platform_variant_id",variant.id).eq("locale",selected.locale).eq("is_selected",true);await admin.from("post_copies").insert({organization_id:item.organization_id,platform_variant_id:variant.id,locale:selected.locale,version:Math.max(...variant.post_copies.map(copy=>copy.version))+1,is_selected:true,headline,subhead,call_to_action:cta,caption:selected.caption,hashtags:selected.hashtags,title:selected.title,description:selected.description});}
     await admin.from("platform_variants").update({selected_media_asset_id:asset.id,platform_config:{compositionState:"rendered",composition}}).eq("content_item_id",item.id).eq("organization_id",item.organization_id);
+    const {error:statusError}=await admin.from("video_render_requests").update({state:"succeeded",media_asset_id:asset.id,error_message:null}).eq("id",requestId);
+    if(statusError)throw new Error(`The render status could not be updated: ${statusError.message}`);
   } catch(error) {
-    console.error("video-composer background render failed", {requestId, contentItemId:item.id, error:error instanceof Error?error.message:String(error)});
+    const message=error instanceof Error?error.message:String(error);
+    console.error("video-composer background render failed", {requestId, contentItemId:item.id, error:message});
+    const {error:statusError}=await admin.from("video_render_requests").update({state:"failed",error_message:"The final video could not be rendered. Please try again."}).eq("id",requestId);
+    if(statusError)console.error("video-composer failure status update failed",{requestId,error:statusError.message});
   }
 }
 
@@ -33,6 +38,8 @@ Deno.serve(async(request)=>{
   const {data:item}=await admin.from("content_items").select("id,organization_id,status,content_revision").eq("id",body.contentItemId).maybeSingle();if(!item||!["ready_for_review","approved"].includes(item.status))return json({error:"This video is not ready for composition."},409);
   const {data:raw}=await admin.from("media_assets").select("id,storage_bucket,storage_path,metadata").eq("id",body.assetId).eq("content_item_id",item.id).eq("organization_id",item.organization_id).maybeSingle();if(!raw||(raw.metadata as Record<string,unknown>)?.rawMaster!==true)return json({error:"The raw video master is unavailable."},404);
   if(!body.requestId)return json({error:"A render request id is required."},400);
+  const {error:requestError}=await admin.from("video_render_requests").insert({id:body.requestId,organization_id:item.organization_id,content_item_id:item.id,state:"rendering"});
+  if(requestError)return json({error:"The render request could not be saved."},500);
   EdgeRuntime.waitUntil(renderVideo(admin,item,raw,body.composition,body.requestId));
   return json({requestId:body.requestId,state:"rendering"},202);
 });
